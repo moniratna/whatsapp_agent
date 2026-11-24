@@ -20,7 +20,7 @@ flowchart LR
     APP --> SK[Markdown skills<br/>deployed with app]
     APP -->|HTTP + open-wa API key| OW
     APP <--> CRM[CRM adapter]
-    APP --> ADMIN[Admin inbox/API]
+    APP --> ADMIN[Admin operations API]
     ADMIN --> DB
     DB -->|eligible de-identified cohort| SR[Background job<br/>skill_reviewer.md]
     SR --> PROP[(Review runs and proposals)]
@@ -29,7 +29,7 @@ flowchart LR
     REVIEW -->|approved code change + tests| SK
 ```
 
-The Python service owns product behavior, persistence, skills, CRM mapping, and admin workflows. open-wa owns the WhatsApp Web session and exposes HTTP operations. Keep the open-wa Easy API reachable only from the application/private network; do not expose its dashboard, health endpoint, or API key to the public internet. The Easy API supports control over HTTP from languages other than Node.js and supports webhook delivery of events to a backend. [open-wa Easy API](https://openwa.dev/docs/getting-started/easy-api), [open-wa receive messages](https://openwa.dev/docs/guides/receive-messages)
+The Python service owns product behavior, persistence, skills, CRM mapping, and admin workflows. open-wa owns the WhatsApp Web session and exposes HTTP operations. Keep the open-wa Easy API and health endpoint reachable only from the application/private network; never expose its API key publicly. The Easy API supports control over HTTP from languages other than Node.js and supports webhook delivery of events to a backend. [open-wa Easy API](https://openwa.dev/docs/getting-started/easy-api), [open-wa receive messages](https://openwa.dev/docs/guides/receive-messages)
 
 ## 2. Decisions and prerequisites
 
@@ -39,7 +39,7 @@ Before implementation begins, record decisions for:
 - WhatsApp number/device that will be linked, who owns the device, and how session recovery will work.
 - Initial deployment is one business account/session; record this as a scope boundary and keep provider session IDs in stored mappings.
 - open-wa deployment model, version pinning, license tier, and accepted operational/account risk.
-- Admin identity provider/authentication. Default to a small internal inbox in the FastAPI app (Jinja2 + HTMX if no UI exists); use the CRM only if its conversation ownership and handover controls meet the requirements.
+- Admin identity provider/authentication and API client authorization. Use the CRM only if its conversation ownership and handover controls meet the requirements.
 - Initial Markdown skills, language(s), currencies, UAE location vocabulary, and requirement completeness criteria.
 - Retention/deletion policy for message history, customer context, raw event payloads, and transcript exports.
 - Hosting, database, queue, secrets manager, backups, monitoring, and deployment environments.
@@ -50,7 +50,7 @@ open-wa is a Node.js toolkit operating through WhatsApp Web, not the official Wh
 
 Pin an open-wa release rather than using an unversioned `latest` deployment. Current documentation lists Node.js 22.21.1 or newer for the Easy API quick start; use the version required by the pinned release. [open-wa quick start](https://openwa.dev/docs/getting-started/quickstart)
 
-Interactive messages (buttons, lists, forms, and other formats) require an applicable open-wa license. Confirm the exact license entitlement and exercise it in a test account before designing the launch intake around interactive UI. Keep free-text alternatives available. [open-wa licensed features](https://openwa.dev/docs/licensing/licensed-features), [open-wa interactive messages](https://openwa.dev/docs/guides/interactive-messages)
+Interactive messages (buttons, lists, forms, and other formats) require an applicable open-wa license. Confirm the exact license entitlement and exercise it in a test account before designing the launch intake around interactive messaging. Keep free-text alternatives available. [open-wa licensed features](https://openwa.dev/docs/licensing/licensed-features), [open-wa interactive messages](https://openwa.dev/docs/guides/interactive-messages)
 
 ## 3. Suggested repository layout
 
@@ -111,7 +111,7 @@ The open-wa Easy API may be run from its generated Node.js project or deployment
 
 1. Deploy a pinned open-wa Easy API in a private network, with its HTTP listener bound to localhost/private interface.
 2. Configure `WA_API_KEY`, persistent session storage, and the selected `sessionId` through deployment secrets/config.
-3. Link a test WhatsApp account by QR scan and verify that restart restores the linked session without exposing the QR/dashboard publicly.
+3. Link a test WhatsApp account by QR scan and verify that restart restores the linked session without exposing public pairing or session-control endpoints.
 4. Configure the open-wa webhook integration to send only required events (at minimum inbound messages and message acknowledgement/status changes) to FastAPI over HTTPS/private networking.
 5. Configure a high-entropy shared secret header for webhook requests. The integration's documented webhook delivery uses configured headers and retries; it is not inherently a signed Meta webhook, so validate the shared secret and network boundary at FastAPI.
 6. Implement the open-wa HTTP client in Python. Attach the API key to every call, use timeouts, and do not log credentials or full customer messages.
@@ -133,10 +133,10 @@ The open-wa Easy API may be run from its generated Node.js project or deployment
 
 **Exit gate:** duplicate webhooks create no duplicate messages; all message actors appear in the thread; failed sends are visible and retryable without losing the original intent.
 
-### Stage 4 — Admin inbox and handover
+### Stage 4 — Admin APIs and handover
 
 1. Add admin authentication and role-based authorization.
-2. Build a review queue from open/assigned `handover_cases` with reason, latest message, contact context, CRM sync status, and full transcript.
+2. Implement authenticated query APIs for open/assigned `handover_cases`, including reason, latest message, contact context, CRM sync status, and paginated transcript.
 3. Add assignment, takeover, direct text reply, private context note, and explicit hand-back actions.
 4. Persist admin replies as normal outbound messages with `sender_type=admin`, actor identity, open-wa message ID, and acknowledgement/delivery status history.
 5. Keep internal context notes in their separate table; never expose them in the WhatsApp transcript or outbound payload accidentally.
@@ -167,7 +167,7 @@ The open-wa Easy API may be run from its generated Node.js project or deployment
 6. Human reviewers identify useful patterns in successful admin answers, repeated unknown questions, and effective follow-up sequences. A developer authors a new/updated `.md` skill from reviewed patterns.
 7. Review the skill change, test it against representative redacted conversations and edge cases, commit it, and deploy it. No raw chat directly rewrites production skill files.
 8. Add a separately scheduled/manual review worker using `skill_reviewer.md`. It reads only approved de-identified transcript cohorts, identifies recurring issues above a configurable minimum evidence threshold, and stores a proposal containing the issue, sanitized evidence references, proposed diff, and regression tests.
-9. Add an admin proposal-review queue. A supervisor may approve or reject with a reason. Approval queues a human-authored code change; it does not edit Markdown files, merge a branch, or deploy. The resulting change still requires code review, CI, and deployment.
+9. Add authenticated proposal query/decision APIs. A supervisor may approve or reject with a reason. Approval queues a human-authored code change; it does not edit Markdown files, merge a branch, or deploy. The resulting change still requires code review, CI, and deployment.
 
 **Exit gate:** a reviewer can trace an automated reply to its skill and release; a full/filtered transcript export contains admin replies and excludes internal notes; a new skill becomes active only after deployment.
 
@@ -215,7 +215,7 @@ For the first usable release, prioritize:
 
 1. open-wa connectivity and text messages.
 2. Durable conversation history, including admin replies.
-3. Admin inbox, direct replies, takeover, and hand-back.
+3. Admin APIs for handover queue, direct replies, takeover, and hand-back.
 4. Buyer/seller requirements and portfolio capture with provenance.
 5. CRM create/update with retries.
 6. A small set of Markdown skills and controlled transcript export.

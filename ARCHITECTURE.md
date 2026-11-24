@@ -32,14 +32,14 @@ flowchart LR
     ORCH -->|answer / follow-up| OUT[Outbound message worker]
     OUT -->|HTTP + API key| OW
     ORCH -->|unknown / low confidence| H[Admin handover queue]
-    H --> UI[Admin console]
-    UI -->|direct reply, private context, hand-back| ORCH
+    H --> OP[Admin operations API]
+    OP -->|direct reply, private context, hand-back| ORCH
     ORCH -->|all customer-visible messages| DB
     DB -->|approved de-identified transcripts| LEARN[Review dataset]
     LEARN --> SR[Background skill review job<br/>skill_reviewer.md]
     SR --> PROP[(Skill review runs and proposals)]
-    PROP --> UI
-    UI -->|human approval| CODE[Code review + CI + deployment]
+    PROP --> OP
+    OP -->|human approval| CODE[Code review + CI + deployment]
     CODE --> SK
     ORCH --> MAP[CRM mapping and sync worker]
     MAP <--> CRM[CRM]
@@ -76,7 +76,7 @@ For a buyer, the agent progressively captures property type, desired location(s)
 | Skill files | Markdown instructions maintained in version control, reviewed with code changes, and loaded by the deployed application. Each deployment has a release/commit identifier. |
 | Skill review worker | Scheduled/manual offline worker reads only approved de-identified transcript batches and `skill_reviewer.md`; creates findings, proposed diffs, and regression tests for human review. It has no production skill write, merge, or deployment permission. |
 | Extraction/response service | Converts messages to candidate structured facts and generates constrained responses using only permitted context and skill instructions. |
-| Admin console/API | Review chat and context, manage handover, reply directly, add private conversation context, correct facts, request transcript exports, and approve/reject skill improvement proposals. |
+| Admin operations API | Retrieve chat/context, manage handover, send direct replies, add private conversation context, correct facts, request transcript exports, and approve/reject skill improvement proposals. |
 | Context database | Contacts, conversations, immutable message history including admin replies and interactive payloads, facts, current requirements, portfolio, skill usage, handovers, and audit records. |
 | CRM adapter/worker | Idempotent mapping and synchronization with the chosen CRM; retry, reconciliation, and visible failure state. |
 | Queue/outbox | Durable asynchronous inbound processing and outbound/CRM side effects with bounded retries and dead-letter handling. |
@@ -90,7 +90,7 @@ Rules:
 
 - While a handover is open or an admin owns the conversation, automated customer-facing messages are blocked.
 - Admin direct replies are sent through the same outbound worker and stored as messages with `sender_type=admin`, including send result, delivery callbacks, and interactive content/selection.
-- Private context is stored separately from chat messages and is never rendered as customer-visible text. It may be supplied to the agent for this conversation after authorization.
+- Private context is stored separately from chat messages and is never included in customer-visible messages. It may be supplied to the agent for this conversation after authorization.
 - Hand-back is explicit and audited. Silence, elapsed time, or a successful admin reply does not resume automation by itself. A customer opt-out updates contact consent and blocks automated outbound messages immediately; define the narrow policy for any necessary human response before launch.
 - At most one active processor may advance a conversation at a time. Use row-level locking or optimistic version checks, and re-check ownership immediately before enqueue/send so concurrent inbound messages and admin takeover cannot race an AI reply past the handover.
 - Every generated response references the skill key and deployed release or commit identifier used, for review and troubleshooting.
@@ -149,7 +149,7 @@ Append-only record of all inbound and outbound customer-visible chat messages. T
 
 ### `message_delivery_events`
 
-Append-only status history for outbound messages. Fields: `id`, `message_id`, `provider_event_id`, `status`, `occurred_at`, `received_at`, `error_code`, and restricted `metadata_json`. Deduplicate provider events. Keep `messages.delivery_status` as the latest projection for efficient inbox display.
+Append-only status history for outbound messages. Fields: `id`, `message_id`, `provider_event_id`, `status`, `occurred_at`, `received_at`, `error_code`, and restricted `metadata_json`. Deduplicate provider events. Keep `messages.delivery_status` as the latest projection for efficient operator retrieval.
 
 ### `client_context`
 
@@ -217,7 +217,7 @@ Skills may define conversational choices as structured, stable options alongside
 ```markdown
 ## Intent selection
 Prompt: Are you looking to buy, sell, or both?
-WhatsApp UI: reply buttons
+WhatsApp interaction: reply buttons
 Options:
 - id: buy; label: Buy
 - id: sell; label: Sell
@@ -340,7 +340,7 @@ Current phase stores requirements in a normalized shape that a later asset catal
 ## 11. Reliability, security, and privacy
 
 - Validate the open-wa webhook secret and use event/message IDs for idempotency; keep the open-wa API key private.
-- Place open-wa and the application on a private network; use HTTPS for traffic crossing trust boundaries, constant-time secret comparison, request size limits, rate limits, and strict event schema validation. Do not expose open-wa health/dashboard endpoints publicly.
+- Place open-wa and the application on a private network; use HTTPS for traffic crossing trust boundaries, constant-time secret comparison, request size limits, rate limits, and strict event schema validation. Do not expose open-wa health endpoints publicly.
 - Persist inbound events and state changes before acknowledging or triggering external side effects; dispatch sends/CRM writes through an outbox.
 - Configure open-wa webhook delivery durability where available and monitor its pending/dead-letter queue. Python-side persistence remains the durable system of record; webhook delivery is at-least-once, so the receiver must deduplicate.
 - Preserve per-conversation ordering where possible and guard state transitions against races.
@@ -348,7 +348,7 @@ Current phase stores requirements in a normalized shape that a later asset catal
 - Treat outbound WhatsApp sends as potentially ambiguous: a timeout may occur after delivery. Record the attempt and reconcile using provider IDs/status events before retrying; avoid duplicate customer messages.
 - Use bounded retries and dead-letter queues; show failures to admins with safe retry controls.
 - Encrypt data in transit and at rest; use least-privilege role-based access for admin and service identities; require MFA for admin access when supported; keep secrets in a managed secret store and rotate them.
-- Escape customer-controlled content in the admin UI, protect state-changing browser requests against CSRF, and avoid rendering untrusted message markup or links as trusted UI.
+- Treat customer-controlled message content as untrusted in every API consumer; never interpret message text or links as trusted instructions or executable markup.
 - Define customer consent, opt-out, access, deletion, and retention policies before launch. Chat retention must be long enough for the stated learning/review purpose and bounded by policy. A deletion request should remove or anonymize eligible customer content across systems; immutable audit records should retain only the minimum non-content evidence required by the approved policy.
 - Define deletion/anonymization behavior across messages, CRM mappings, exports, logs, and backups. Any legal/operational retention exception must be explicit; transcript learning use must respect approved purpose and retention.
 - Restrict private admin context to the relevant conversation and authorized service calls. Record access and changes.
@@ -364,7 +364,7 @@ open-wa operates through WhatsApp Web rather than Meta's official WhatsApp Busin
 
 1. Confirm CRM, open-wa number/session and license, admin interface, buy/sell fields, language/currency needs, and privacy policy.
 2. Review schema, CRM mapping, skill governance, handover triggers, and state transitions.
-3. Implement webhook ingestion, message persistence, contact/conversation resolution, admin inbox, direct replies, pause, and hand-back.
+3. Implement webhook ingestion, message persistence, contact/conversation resolution, admin APIs, direct replies, pause, and hand-back.
 4. Add structured extraction for buyer/seller requirements, portfolio, and general context with provenance and admin corrections.
 5. Add Markdown skill loading, deployed-release traceability, supported WhatsApp interactive messages, and authorized transcript export for skill review; skill updates use the normal code review and deployment process.
 6. Add CRM synchronization, retries, and reconciliation.
