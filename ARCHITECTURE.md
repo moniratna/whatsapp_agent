@@ -1,7 +1,7 @@
 # WhatsApp Real Estate Agent — Architecture Proposal
 
 **Status:** For architecture review  
-**Scope:** WhatsApp automation, CRM synchronization, and customer context mapping. Email is excluded.  
+**Scope:** WhatsApp automation using open-wa, a Python/uv/FastAPI application, CRM synchronization, and customer context mapping. Email is excluded.  
 **Future extension:** Match structured client requirements against UAE property assets. Inventory ingestion and matchmaking are later phases; this phase prepares compatible data and APIs without claiming to search live inventory.
 
 ## 1. Product model
@@ -10,14 +10,17 @@ A customer starts or continues a WhatsApp conversation. A conversational agent u
 
 Skills are Markdown files in the code repository (for example, `buyer_intake.md`, `seller_intake.md`, `portfolio_capture.md`, and `general_uae_property_faq.md`). They guide what to ask and how to handle a domain. Conversation transcripts are retained as material for the team to review when proposing improved skills. A skill change is reviewed, committed, and deployed with the application; chats do not automatically rewrite skills. Git history and the deployed application release provide the skill change history.
 
-When the agent cannot answer confidently, encounters an unknown question, or needs an admin decision, it pauses automated replies and creates a handover. An admin can send a direct WhatsApp reply, provide private context for the assistant to use, or do both. The system records which action happened. The assistant resumes only after an explicit admin hand-back. Private admin context is not sent to the customer unless the admin deliberately turns it into a reply.
+When the agent cannot answer confidently, encounters an unknown question, or needs an admin decision, it pauses automated replies and creates a handover. Every admin message sent to the customer is stored in the same durable conversation history as customer and automated messages, including its provider ID, delivery status, and interactive payload where applicable. An admin can also provide private context for the assistant to use. The assistant resumes only after an explicit admin hand-back. Private admin context is not sent to the customer unless the admin deliberately turns it into a reply.
+
+The team can extract conversation history, including admin replies, to review successful handling patterns and develop new Markdown skills. Chat patterns are evidence for a human-authored skill change, which is reviewed, tested, committed, and deployed; live conversations do not automatically train or publish skills.
 
 ## 2. Visible architecture diagram
 
 ```mermaid
 flowchart LR
-    C[Customer] <-->|WhatsApp messages| W[WhatsApp Business Platform]
-    W -->|signed webhook| WH[Webhook ingress]
+    C[Customer] <-->|WhatsApp Web session| W[WhatsApp]
+    W <--> OW[open-wa Easy API<br/>Node.js process]
+    OW -->|webhook + shared secret| WH[FastAPI webhook ingress]
     WH --> IN[(Inbound event store / queue)]
     IN --> ORCH[Conversation orchestrator]
     ORCH <--> DB[(Customer context and chat database)]
@@ -25,27 +28,30 @@ flowchart LR
     SK --> ORCH
     ORCH <--> AI[LLM / extraction and response]
     ORCH -->|answer / follow-up| OUT[Outbound message worker]
-    OUT --> W
+    OUT -->|HTTP + API key| OW
     ORCH -->|unknown / low confidence| H[Admin handover queue]
     H --> UI[Admin console]
     UI -->|direct reply, private context, hand-back| ORCH
+    ORCH -->|all customer-visible messages| DB
+    DB -->|authorized transcript export| LEARN[Redacted conversation review corpus]
+    LEARN -->|review patterns and author skill changes| SK
     ORCH --> MAP[CRM mapping and sync worker]
     MAP <--> CRM[CRM]
     CDB[(Structured client requirements / portfolio)] --> FUT[Future UAE asset matcher]
     DB --> CDB
 ```
 
-`CDB` represents the structured context tables in the application database, not a separate database. The future matcher is shown as a downstream consumer only; inventory and matching are not part of the current WhatsApp delivery scope.
+`CDB` represents the structured context tables in the application database, not a separate database. `LEARN` is a controlled review/export process, not an automatic training service. The future matcher is shown as a downstream consumer only; inventory and matching are not part of the current WhatsApp delivery scope.
 
 ## 3. WhatsApp conversation flow
 
-1. **Receive:** Customer messages the WhatsApp business number. The provider webhook is signature-checked, normalized, deduplicated, and persisted before acknowledging receipt.
-2. **Identify:** Resolve the contact by WhatsApp number and provider account. Create a contact/conversation when needed. Link a CRM record if a stable match exists; otherwise create a CRM lead according to the agreed CRM mapping policy.
-3. **Understand intent:** Classify the conversation as buying, selling, portfolio sharing, general enquiry, or unclear. Load relevant customer context and the published skill version selected for the turn.
-4. **Extract and ask:** Store the inbound message, extract candidate facts with source and confidence, update structured context, and ask the most useful missing or clarifying question. Do not repeat fields already answered unless clarification is needed.
+1. **Receive:** Customer messages the WhatsApp number linked to open-wa. FastAPI validates the configured webhook shared secret, normalizes and deduplicates the open-wa event, and persists it before acknowledging receipt.
+2. **Identify:** Resolve the contact by WhatsApp number and open-wa session. Create a contact/conversation when needed. Link a CRM record if a stable match exists; otherwise create a CRM lead according to the agreed CRM mapping policy.
+3. **Understand intent:** Classify the conversation as buying, selling, portfolio sharing, general enquiry, or unclear. Load relevant customer context and the Markdown skill from the deployed release selected for the turn.
+4. **Extract and ask:** Store the inbound message, extract candidate facts with source and confidence, update structured context, and ask the most useful missing or clarifying question. Where licensed and supported, send an open-wa interactive list or reply buttons (for example, Buy / Sell / Both, or a short set of locations). Consider longer structured forms only after validating support and license. Keep a text fallback and allow free-form answers. Do not repeat fields already answered unless clarification is needed.
 5. **Synchronize:** Queue CRM create/update events for meaningful contact, intent, requirement, portfolio, and consent changes. CRM failure must not discard the message or conversation update.
 6. **Answer or hand over:** If the question is in-skill and sufficiently supported, respond. If unknown, low-confidence, sensitive, contradictory, or explicitly requested for a human, create a handover and pause assistant sends.
-7. **Admin action:** Admin reviews recent messages, structured context, selected skill/version, and handover reason. Admin may send a direct reply, add private context/instructions for this conversation, or both. Every action is attributed and stored.
+7. **Admin action:** Admin reviews the full message history, structured context, selected skill/release, and handover reason. Admin may send a text or supported interactive WhatsApp message, add private context/instructions for this conversation, or both. Every action is attributed and stored as appropriate.
 8. **Resume:** Admin explicitly hands back to the assistant. The orchestrator incorporates approved private context into the next turn, resumes the applicable skill, and continues collecting missing information.
 9. **Future matching readiness:** When requirements are sufficiently structured, mark the requirement as ready for later matching. No asset recommendation is made in this phase.
 
@@ -57,13 +63,14 @@ For a buyer, the agent progressively captures property type, desired location(s)
 
 | Component | Responsibility |
 | --- | --- |
-| WhatsApp adapter | Provider-specific webhook verification, payload normalization, outbound sends, template/session enforcement, and delivery callbacks. |
+| open-wa Easy API | Separate Node.js process owns the WhatsApp Web session, QR pairing, inbound event delivery, and outbound WhatsApp operations. Keep its API on a private network. |
+| FastAPI open-wa adapter | Validates the configured webhook secret, normalizes open-wa event payloads, invokes the open-wa HTTP API with its API key, and maps acknowledgements/status events. |
 | Webhook ingress | Fast validation and durable event acceptance; deduplication and queue handoff. |
 | Conversation orchestrator | State machine; contact resolution; skill selection; context loading; extraction, response, handover, and CRM event decisions. |
 | Skill files | Markdown instructions maintained in version control, reviewed with code changes, and loaded by the deployed application. Each deployment has a release/commit identifier. |
 | Extraction/response service | Converts messages to candidate structured facts and generates constrained responses using only permitted context and skill instructions. |
-| Admin console/API | Review chat and context, manage handover, reply directly, add private conversation context, correct facts, and review/publish skill versions. |
-| Context database | Contacts, conversations, immutable message history, facts, current requirements, portfolio, skill usage, handovers, and audit records. |
+| Admin console/API | Review chat and context, manage handover, reply directly, add private conversation context, correct facts, and request authorized transcript exports for skill development. |
+| Context database | Contacts, conversations, immutable message history including admin replies and interactive payloads, facts, current requirements, portfolio, skill usage, handovers, and audit records. |
 | CRM adapter/worker | Idempotent mapping and synchronization with the chosen CRM; retry, reconciliation, and visible failure state. |
 | Queue/outbox | Durable asynchronous inbound processing and outbound/CRM side effects with bounded retries and dead-letter handling. |
 | Future inventory/matching service | Later consumer of structured requirements and asset data; not implemented in this phase. |
@@ -75,12 +82,12 @@ Suggested states: `active_agent`, `admin_handover`, `admin_owned`, `awaiting_adm
 Rules:
 
 - While a handover is open or an admin owns the conversation, automated customer-facing messages are blocked.
-- Admin direct replies are sent through the same outbound worker and stored as messages with `sender_type=admin`.
+- Admin direct replies are sent through the same outbound worker and stored as messages with `sender_type=admin`, including send result, delivery callbacks, and interactive content/selection.
 - Private context is stored separately from chat messages and is never rendered as customer-visible text. It may be supplied to the agent for this conversation after authorization.
 - Hand-back is explicit and audited. Silence, elapsed time, or a successful admin reply does not resume automation by itself.
-- Every generated response references the skill file/key and deployed release or commit identifier used, for review and troubleshooting.
+- Every generated response references the skill key and deployed release or commit identifier used, for review and troubleshooting.
 - Facts are not silently overwritten by lower-confidence or contradictory extraction. Retain provenance and flag conflicts for clarification or admin review.
-- Skill content is shared configuration. Only authorized admins can publish a new version; conversations may record the version used for each turn.
+- Skill content is shared configuration in Markdown. Changes go through code review and deployment; conversations may record the skill and release used for each automated turn.
 
 ## 6. Customer context and schema
 
@@ -93,7 +100,7 @@ One person/client identity, potentially linked to multiple conversations and CRM
 | Fields | Description |
 | --- | --- |
 | `id UUID PK` | Internal identity. |
-| `phone_e164 TEXT UNIQUE` | WhatsApp number; consider provider/account scoping if multiple business tenants exist. |
+| `phone_e164 TEXT UNIQUE` | WhatsApp number; consider open-wa session/account scoping if multiple business tenants exist. |
 | `display_name TEXT NULL` | Name as supplied by customer/provider. |
 | `preferred_language TEXT NULL` | Language preference when known. |
 | `consent_status TEXT` | Consent/opt-out state according to the approved policy. |
@@ -105,7 +112,7 @@ One person/client identity, potentially linked to multiple conversations and CRM
 | --- | --- |
 | `id UUID PK`, `contact_id UUID FK` | Conversation and client. |
 | `channel TEXT` | `whatsapp` in this scope. |
-| `provider_account_id TEXT`, `provider_thread_id TEXT NULL` | Provider routing and thread identifiers. |
+| `provider_account_id TEXT`, `provider_thread_id TEXT NULL` | open-wa session and chat identifiers. |
 | `state TEXT` | Current automation/admin state. |
 | `active_intent TEXT NULL` | `buy`, `sell`, `portfolio`, `general`, `unknown`, or `mixed`. |
 | `assigned_admin_id UUID/TEXT NULL` | Current admin owner. |
@@ -116,18 +123,20 @@ Indexes: `(contact_id, updated_at DESC)`, `(state, updated_at)`, unique provider
 
 ### `messages`
 
-Append-only record of all inbound and outbound chat messages. Admin private context does not belong in this table.
+Append-only record of all inbound and outbound customer-visible chat messages. This includes every admin message sent after handover and all automated replies. Admin private context does not belong in this table.
 
 | Fields | Description |
 | --- | --- |
 | `id UUID PK`, `conversation_id UUID FK` | Message and conversation. |
 | `provider_message_id TEXT NULL` | Unique provider message key for deduplication, scoped by provider/account. |
 | `direction TEXT` | `inbound` / `outbound`. |
-| `sender_type TEXT` | `customer`, `agent`, `admin`, or `system`. |
-| `body_text TEXT NULL`, `message_type TEXT` | Text and normalized type; media can be added via attachments later. |
+| `sender_type TEXT` | `customer`, `automated_agent`, `admin`, or `system`. |
+| `body_text TEXT NULL`, `message_type TEXT` | Text and normalized type, e.g. `text`, `interactive_list`, `interactive_button`, or `image`. |
+| `interactive_payload JSONB NULL` | Outbound options or inbound selection: provider type, stable option IDs, labels, selected option, and provider metadata. For inbound selections, link to the originating interactive message when the provider supplies that reference. |
+| `provider_payload_ref TEXT NULL` | Optional restricted reference to raw webhook data for troubleshooting. |
 | `provider_timestamp TIMESTAMPTZ NULL` | Provider event time. |
 | `delivery_status TEXT NULL` | `queued`, `sent`, `delivered`, `read`, `failed`, etc. |
-| `skill_version_id UUID NULL` | Skill version used for an automated response. |
+| `skill_key TEXT NULL`, `application_release TEXT NULL` | Skill and deployed release used for automated responses; null for admin/customer messages. |
 | `created_at TIMESTAMPTZ` | Ingestion/creation time. |
 
 ### `client_context`
@@ -189,7 +198,22 @@ Fields: `id UUID PK`, `contact_id UUID FK`, `entity_type TEXT`, `entity_id UUID`
 
 Skills are repository Markdown files, not database records. Store them in a predictable directory such as `skills/`, with a short metadata header for the skill key, intent, and applicable workflow. The deployed application loads these files; deployment, not a database publish action, changes active skill behavior. Keep review and testing in the normal code review/deployment process.
 
-For traceability, record `skill_key`, `skill_file_path` (or stable key only), and `application_release` (commit SHA or release ID) on automated assistant turns/messages. The content itself remains in version control. This avoids duplicating skill text in the database while allowing the team to identify the exact deployed instructions used for a response.
+For traceability, record `skill_key` and `application_release` (commit SHA or release ID) on automated assistant turns/messages. The content itself remains in version control. This avoids duplicating skill text in the database while allowing the team to identify the exact deployed instructions used for a response.
+
+Skills may define conversational choices as structured, stable options alongside their Markdown instructions. For example:
+
+```markdown
+## Intent selection
+Prompt: Are you looking to buy, sell, or both?
+WhatsApp UI: reply buttons
+Options:
+- id: buy; label: Buy
+- id: sell; label: Sell
+- id: both; label: Both
+Fallback: If interactive messages cannot be sent, ask the same question as text.
+```
+
+The runtime maps these definitions to open-wa's supported interactive message format. Store option IDs in skill definitions and message payloads; use labels only for display. The customer may select an option or type a different answer, so both paths must be handled. Interactive message types and licensing are specific to the selected open-wa release and license; confirm them and degrade to plain text when unavailable. See [open-wa interactive messages](https://openwa.dev/docs/guides/interactive-messages) and [open-wa licensed features](https://openwa.dev/docs/licensing/licensed-features).
 
 ### `handover_cases`
 
@@ -197,24 +221,25 @@ Fields: `id`, `conversation_id`, `status` (`open`, `admin_owned`, `resolved`, `h
 
 ### `admin_context_notes`
 
-Private conversation-scoped instructions/context. Fields: `id`, `conversation_id`, `handover_case_id`, `admin_id`, `note_text`, `visibility` (always `internal` in this phase), `created_at`, `superseded_at`. These notes are available to the assistant only in that conversation after authorization; never sent as customer messages.
+Private conversation-scoped instructions/context. Fields: `id`, `conversation_id`, `handover_case_id`, `admin_id`, `note_text`, `visibility` (always `internal` in this phase), `created_at`, `superseded_at`. These notes are available to the assistant only in that conversation after authorization; never sent as customer messages. They are not chat messages and are excluded from transcript exports by default.
 
 ### `crm_links`, `integration_events`, and `audit_events`
 
 - `crm_links`: internal contact/requirement IDs, CRM name, external contact/lead IDs, mapping status, last sync/error, timestamps. Use unique constraints on external IDs and internal-to-CRM mappings.
 - `integration_events`: inbox/outbox event ID, integration, external event ID, event type, aggregate ID, payload, status, attempt count, next retry, error, timestamps. Unique inbound key `(integration, external_event_id)`.
-- `audit_events`: actor, action, entity, before/after state references, reason, metadata, timestamp. Capture admin replies, private context additions, fact corrections, skill publication, handover transitions, and CRM mapping changes.
+- `audit_events`: actor, action, entity, before/after state references, reason, metadata, timestamp. Capture admin replies, private context additions, fact corrections, transcript exports, handover transitions, and CRM mapping changes.
 
 ## 7. Skill lifecycle and controlled learning
 
-1. Persist every chat message according to retention policy and link automated turns to the skill key and deployed release.
-2. Admins review unresolved questions, corrections, repeated follow-ups, and useful conversation patterns. A future reporting view can group these without exposing more personal information than needed.
-3. An authorized developer updates the relevant Markdown skill file in version control, including its purpose, trigger conditions, instructions, required fields, examples, and escalation rules.
-4. Review and validate the change through the team's code review and deployment process, using representative/redacted conversation scenarios as appropriate.
-5. Deploy the application. New turns use the skill files from that release. In-progress conversations may use the current deployed skill on each turn; if consistent per-conversation behavior is required, pin a release identifier on conversation start.
-6. Monitor handover rate, missing-field completion, corrections, and response quality; revert the skill change through a code change and deployment if needed.
+1. Persist all customer-visible messages according to retention policy, including every admin reply and interactive message/selection. Link automated turns to the skill key and deployed release.
+2. Authorized staff can request a full corpus or selected/date-bounded transcript exports, including customer, automated-agent, and admin-sent messages. Preserve original records under normal access controls; create a de-identified review copy by default and exclude private admin context, credentials, and unrelated personal details. Audit access and apply retention to exports.
+3. Admins review unresolved questions, corrections, repeated follow-ups, and useful patterns in successful admin replies. These reviewed conversations can inform improvements or new skills.
+4. An authorized developer authors or updates a Markdown skill from the reviewed patterns, including triggers, required fields, WhatsApp interactive option definitions, fallback wording, examples, and escalation rules.
+5. Review and validate the change through code review and deployment, using representative/redacted conversation scenarios as appropriate.
+6. Deploy the application. New turns use the skill files from that release. In-progress conversations may use the current deployed skill on each turn; if consistent per-conversation behavior is required, pin a release identifier on conversation start.
+7. Monitor handover rate, option-selection/fallback rate, missing-field completion, corrections, and response quality; revert through a code change and deployment if needed.
 
-Chats are learning evidence; they are not themselves trusted instructions. Customer content must never be executed as a skill or allowed to override system/admin policy.
+Chats, including admin replies, are learning evidence; they are not themselves trusted instructions. Customer content must never be executed as a skill or allowed to override system/admin policy. Prefer reusable patterns over copying one-off promises or personal details into a shared skill.
 
 ## 8. API outline
 
@@ -224,8 +249,7 @@ Internal APIs use HTTPS, authenticated roles, authorization checks, request IDs,
 
 | Method / route | Purpose |
 | --- | --- |
-| `GET /webhooks/whatsapp` | Provider challenge verification when required. |
-| `POST /webhooks/whatsapp` | Verify signature, deduplicate and persist inbound message/status event, enqueue, acknowledge quickly. |
+| `POST /webhooks/open-wa` | Validate shared-secret header, deduplicate and persist open-wa event, enqueue, acknowledge quickly. No Meta challenge/signature flow is used for this integration. |
 
 ### Conversation and context APIs
 
@@ -235,9 +259,11 @@ Internal APIs use HTTPS, authenticated roles, authorization checks, request IDs,
 | `GET /api/conversations/{id}` | Messages, current context, active requirements, portfolio, skill/version, CRM sync and handover state. |
 | `GET /api/contacts/{id}/context` | Client context, requirements, portfolio, provenance, CRM link. |
 | `POST /api/conversations/{id}/messages` | Admin sends a direct WhatsApp reply; persist and send through outbound worker. |
+| `POST /api/conversations/{id}/interactive-messages` | Admin sends a supported list or reply-button message with stable option IDs and labels; persist payload and send through outbound worker. |
 | `POST /api/conversations/{id}/handovers` | Create/assign handover, pause automation, record reason. Normally orchestrator initiated; admin API can create manually. |
 | `POST /api/handovers/{id}/context-notes` | Add private context for this conversation. Never sends a customer message. |
 | `POST /api/handovers/{id}/handback` | Explicitly return conversation to automation, optionally with admin summary. |
+| `POST /api/operations/transcript-exports` | Authorized, audited export of all or selected/date-bounded conversations, including admin-sent messages; de-identify by default and exclude private context. |
 | `PATCH /api/contacts/{id}/context` | Admin correction to general context with provenance. |
 | `POST /api/contacts/{id}/requirements` | Create a buy/sell requirement. |
 | `PATCH /api/requirements/{id}` | Correct/update requirement fields and readiness. |
@@ -285,7 +311,7 @@ Current phase stores requirements in a normalized shape that a later asset catal
 
 ## 11. Reliability, security, and privacy
 
-- Verify provider webhook signatures and use provider message/event IDs for idempotency.
+- Validate the open-wa webhook secret and use event/message IDs for idempotency; keep the open-wa API key private.
 - Persist inbound events and state changes before acknowledging or triggering external side effects; dispatch sends/CRM writes through an outbox.
 - Preserve per-conversation ordering where possible and guard state transitions against races.
 - Block AI outbound sends transactionally when a handover/admin ownership is active.
@@ -296,22 +322,22 @@ Current phase stores requirements in a normalized shape that a later asset catal
 - Minimize model context to relevant messages and facts. Treat chats as untrusted input; do not let them change skills, policies, tools, or permissions.
 - Keep logs focused on IDs, state, timings, and error codes; avoid logging full message bodies, admin notes, tokens, or unnecessary personal data.
 
-Confirm current WhatsApp provider rules for customer service windows, templates, opt-in, rate limits, and delivery callbacks when selecting the integration. The adapter must enforce applicable sending restrictions and present actionable failures to admins.
+open-wa operates through WhatsApp Web rather than Meta's official WhatsApp Business Platform API. Treat it as a separate, self-hosted integration with a persistent linked-device session, and assess account, operational, and terms-of-service risk before production. Keep the open-wa API private, use its API key and a shared secret for webhooks, persist/recover its session safely, and design for reconnects and duplicate event delivery. Interactive messages require an applicable open-wa license; verify license entitlements and test supported message types before committing to list/button/Flow-based UX. Provide a text fallback.
 
 ## 12. Delivery sequence
 
-1. Confirm CRM, WhatsApp provider/business number, admin interface, buy/sell fields, language/currency needs, and privacy policy.
+1. Confirm CRM, open-wa number/session and license, admin interface, buy/sell fields, language/currency needs, and privacy policy.
 2. Review schema, CRM mapping, skill governance, handover triggers, and state transitions.
 3. Implement webhook ingestion, message persistence, contact/conversation resolution, admin inbox, direct replies, pause, and hand-back.
 4. Add structured extraction for buyer/seller requirements, portfolio, and general context with provenance and admin corrections.
-5. Add Markdown skill loading and deployed-release traceability; skill updates use the normal code review and deployment process.
+5. Add Markdown skill loading, deployed-release traceability, supported WhatsApp interactive messages, and authorized transcript export for skill review; skill updates use the normal code review and deployment process.
 6. Add CRM synchronization, retries, and reconciliation.
 7. Pilot with human review enabled; monitor errors, handovers, corrections, completeness, and customer experience.
 8. In a separate phase, ingest UAE assets and build/review matchmaking.
 
 ## 13. Decisions for review
 
-1. Which CRM and WhatsApp provider/business number are selected?
+1. Which CRM and open-wa linked number/session are selected?
 2. Which roles are included under “admin,” and is the agent persona an automated assistant, human agent, or both? This proposal treats “agent” as the automated conversational agent and “admin” as the human operator.
 3. Which Markdown skills are needed at launch (buyer intake, seller intake, portfolio capture, FAQs)?
 4. What exactly triggers handover: unknown topic, low confidence threshold, customer request, contradictions, sensitive question, or all of these?
@@ -326,7 +352,9 @@ Confirm current WhatsApp provider rules for customer service windows, templates,
 - WhatsApp messages are stored once despite webhook retries and remain linked to client context.
 - Buy requirements, sell requirements, current portfolio, and other shared context are distinct structured data.
 - Every structured fact has provenance and can be corrected without losing history.
-- A handover pauses automation; admin can reply or add private context; explicit hand-back resumes it.
-- Skills live as Markdown files in version control and change through deployment; automated turns record the skill and release used; raw chats do not self-publish instructions.
+- A handover pauses automation; admin can reply or add private context; explicit hand-back resumes it. All admin customer-visible messages are persisted with delivery status.
+- Full conversation exports can include admin replies for controlled skill review; new skills are human-authored Markdown changes, reviewed and deployed rather than learned/published automatically.
+- Skills live as Markdown files in version control and change through deployment; automated turns record the skill and release used.
+- Skills can request WhatsApp interactive lists/buttons where supported, while preserving free-text and fallback handling.
 - CRM create/update behavior is idempotent, mapped, retryable, and visible to admins.
 - Structured requirements are suitable for a future UAE asset matcher without implying inventory availability today.
