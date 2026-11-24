@@ -22,8 +22,11 @@ flowchart LR
     APP <--> CRM[CRM adapter]
     APP --> ADMIN[Admin inbox/API]
     ADMIN --> DB
-    DB --> EXP[Authorized transcript export]
-    EXP --> REVIEW[Human review and skill authoring]
+    DB -->|eligible de-identified cohort| SR[Background job<br/>skill_reviewer.md]
+    SR --> PROP[(Review runs and proposals)]
+    PROP --> ADMIN
+    ADMIN -->|approve or reject| REVIEW[Human review and skill authoring]
+    REVIEW -->|approved code change + tests| SK
 ```
 
 The Python service owns product behavior, persistence, skills, CRM mapping, and admin workflows. open-wa owns the WhatsApp Web session and exposes HTTP operations. Keep the open-wa Easy API reachable only from the application/private network; do not expose its dashboard, health endpoint, or API key to the public internet. The Easy API supports control over HTTP from languages other than Node.js and supports webhook delivery of events to a backend. [open-wa Easy API](https://openwa.dev/docs/getting-started/easy-api), [open-wa receive messages](https://openwa.dev/docs/guides/receive-messages)
@@ -36,7 +39,7 @@ Before implementation begins, record decisions for:
 - WhatsApp number/device that will be linked, who owns the device, and how session recovery will work.
 - Initial deployment is one business account/session; record this as a scope boundary and keep provider session IDs in stored mappings.
 - open-wa deployment model, version pinning, license tier, and accepted operational/account risk.
-- Admin identity/authentication and whether the admin inbox is a new UI or an existing CRM surface.
+- Admin identity provider/authentication. Default to a small internal inbox in the FastAPI app (Jinja2 + HTMX if no UI exists); use the CRM only if its conversation ownership and handover controls meet the requirements.
 - Initial Markdown skills, language(s), currencies, UAE location vocabulary, and requirement completeness criteria.
 - Retention/deletion policy for message history, customer context, raw event payloads, and transcript exports.
 - Hosting, database, queue, secrets manager, backups, monitoring, and deployment environments.
@@ -70,7 +73,8 @@ Interactive messages (buttons, lists, forms, and other formats) require an appli
 │   ├── buyer_intake.md
 │   ├── seller_intake.md
 │   ├── portfolio_capture.md
-│   └── general_property_questions.md
+│   ├── general_property_questions.md
+│   └── skill_reviewer.md            # Offline transcript review and proposal drafting only
 ├── migrations/
 ├── tests/
 ├── deploy/
@@ -162,8 +166,12 @@ The open-wa Easy API may be run from its generated Node.js project or deployment
 5. Default skill-review exports to de-identified copies. Exclude private admin notes, secrets, and unrelated personal information; retain exports only as long as needed.
 6. Human reviewers identify useful patterns in successful admin answers, repeated unknown questions, and effective follow-up sequences. A developer authors a new/updated `.md` skill from reviewed patterns.
 7. Review the skill change, test it against representative redacted conversations and edge cases, commit it, and deploy it. No raw chat directly rewrites production skill files.
+8. Add a separately scheduled/manual review worker using `skill_reviewer.md`. It reads only approved de-identified transcript cohorts, identifies recurring issues above a configurable minimum evidence threshold, and stores a proposal containing the issue, sanitized evidence references, proposed diff, and regression tests.
+9. Add an admin proposal-review queue. A supervisor may approve or reject with a reason. Approval queues a human-authored code change; it does not edit Markdown files, merge a branch, or deploy. The resulting change still requires code review, CI, and deployment.
 
 **Exit gate:** a reviewer can trace an automated reply to its skill and release; a full/filtered transcript export contains admin replies and excludes internal notes; a new skill becomes active only after deployment.
+
+**Skill-review exit gate:** a scheduled run over a de-identified test cohort produces a proposal and regression tests; a single anecdote below the configured threshold is not generalized; the reviewer cannot change live skills; proposal approval/rejection is attributable and does not deploy.
 
 ### Stage 7 — WhatsApp interactive choices
 
@@ -186,8 +194,9 @@ The open-wa Easy API may be run from its generated Node.js project or deployment
 4. Before send, re-check conversation ownership and opt-out state transactionally. Cancel queued AI sends if admin takeover happened after generation or the customer opted out. Define the approved exception, if any, for human replies after opt-out.
 5. Save the generated response, skill/release, and relevant decision metadata before sending through the outbox.
 6. Add rate limits, token/cost limits, timeout handling, and a safe fallback when model/extraction calls fail.
+7. Add rollout modes: `off`, `shadow`, `assisted`, `canary`, and `active`. Start production in `shadow`; require a supervisor reason to change mode. Add a global kill switch that blocks AI sends while preserving inbound capture and admin operations. Canary mode must use an explicit expiring allowlist, never model/customer-selected eligibility.
 
-**Exit gate:** tested unknown, conflicting, maliciously phrased, and unsupported requests hand over; paused conversations never receive AI sends; extracted facts keep provenance.
+**Exit gate:** tested unknown, conflicting, maliciously phrased, and unsupported requests hand over; paused conversations never receive AI sends; extracted facts keep provenance; shadow and kill-switch modes cannot send to customers.
 
 ### Stage 9 — Observability, recovery, and pilot
 
@@ -233,6 +242,7 @@ Defer asset inventory, automated property matching, customer-facing recommendati
 - `portfolio_capture.md`: current properties and customer-shared ownership/portfolio details.
 - `general_property_questions.md`: approved general answers and explicit handover boundaries.
 - `unknown_question_handover.md`: acknowledge unknowns, avoid guessing, create admin handover, and resume after admin hand-back.
+- `skill_reviewer.md`: offline-only reviewer prompt that spots repeated mistakes in de-identified chats and drafts proposed skill diffs plus regression tests. It cannot answer customers or directly edit/deploy skills.
 
 Each skill should use stable field/option IDs, distinguish required from optional information, specify interactive choices where useful, and define free-text and handover behavior.
 

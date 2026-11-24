@@ -10,7 +10,7 @@
 
 A customer starts or continues a WhatsApp conversation. A conversational agent uses the currently published set of skills to understand the customer's goal, ask relevant follow-up questions, and maintain a structured client context. The customer can be a buyer, seller, or both. The system stores the full chat history and maps facts from that history into CRM and customer context records.
 
-Skills are Markdown files in the code repository (for example, `buyer_intake.md`, `seller_intake.md`, `portfolio_capture.md`, and `general_uae_property_faq.md`). They guide what to ask and how to handle a domain. Conversation transcripts are retained as material for the team to review when proposing improved skills. A skill change is reviewed, committed, and deployed with the application; chats do not automatically rewrite skills. Git history and the deployed application release provide the skill change history.
+Skills are Markdown files in the code repository (for example, `buyer_intake.md`, `seller_intake.md`, `portfolio_capture.md`, `general_property_questions.md`, and `skill_reviewer.md`). The first four guide customer-facing conversations. `skill_reviewer.md` is an offline analysis skill run by a background job over approved, de-identified transcripts. It looks for recurring mistakes and drafts a proposed Markdown change plus regression tests. It cannot edit deployed skill files, merge code, or deploy. An authorized human reviews and approves/rejects the proposal; approved fixes still go through code review, tests, and deployment before changing live behavior.
 
 When the agent cannot answer confidently, encounters an unknown question, or needs an admin decision, it pauses automated replies and creates a handover. Every admin message sent to the customer is stored in the same durable conversation history as customer and automated messages, including its provider ID, delivery status, and interactive payload where applicable. An admin can also provide private context for the assistant to use. The assistant resumes only after an explicit admin hand-back. Private admin context is not sent to the customer unless the admin deliberately turns it into a reply.
 
@@ -35,15 +35,19 @@ flowchart LR
     H --> UI[Admin console]
     UI -->|direct reply, private context, hand-back| ORCH
     ORCH -->|all customer-visible messages| DB
-    DB -->|authorized transcript export| LEARN[Redacted conversation review corpus]
-    LEARN -->|review patterns and author skill changes| SK
+    DB -->|approved de-identified transcripts| LEARN[Review dataset]
+    LEARN --> SR[Background skill review job<br/>skill_reviewer.md]
+    SR --> PROP[(Skill review runs and proposals)]
+    PROP --> UI
+    UI -->|human approval| CODE[Code review + CI + deployment]
+    CODE --> SK
     ORCH --> MAP[CRM mapping and sync worker]
     MAP <--> CRM[CRM]
     CDB[(Structured client requirements / portfolio)] --> FUT[Future UAE asset matcher]
     DB --> CDB
 ```
 
-`CDB` represents the structured context tables in the application database, not a separate database. `LEARN` is a controlled review/export process, not an automatic training service. The future matcher is shown as a downstream consumer only; inventory and matching are not part of the current WhatsApp delivery scope.
+`CDB` represents the structured context tables in the application database, not a separate database. `LEARN` is a restricted, de-identified review dataset. The skill reviewer proposes changes; a human approval and the normal code/CI/deployment path are required before production skills change. The future matcher is shown as a downstream consumer only; inventory and matching are not part of the current WhatsApp delivery scope.
 
 ## 3. WhatsApp conversation flow
 
@@ -70,8 +74,9 @@ For a buyer, the agent progressively captures property type, desired location(s)
 | Webhook ingress | Fast validation and durable event acceptance; deduplication and queue handoff. |
 | Conversation orchestrator | State machine; contact resolution; skill selection; context loading; extraction, response, handover, and CRM event decisions. |
 | Skill files | Markdown instructions maintained in version control, reviewed with code changes, and loaded by the deployed application. Each deployment has a release/commit identifier. |
+| Skill review worker | Scheduled/manual offline worker reads only approved de-identified transcript batches and `skill_reviewer.md`; creates findings, proposed diffs, and regression tests for human review. It has no production skill write, merge, or deployment permission. |
 | Extraction/response service | Converts messages to candidate structured facts and generates constrained responses using only permitted context and skill instructions. |
-| Admin console/API | Review chat and context, manage handover, reply directly, add private conversation context, correct facts, and request authorized transcript exports for skill development. |
+| Admin console/API | Review chat and context, manage handover, reply directly, add private conversation context, correct facts, request transcript exports, and approve/reject skill improvement proposals. |
 | Context database | Contacts, conversations, immutable message history including admin replies and interactive payloads, facts, current requirements, portfolio, skill usage, handovers, and audit records. |
 | CRM adapter/worker | Idempotent mapping and synchronization with the chosen CRM; retry, reconciliation, and visible failure state. |
 | Queue/outbox | Durable asynchronous inbound processing and outbound/CRM side effects with bounded retries and dead-letter handling. |
@@ -236,6 +241,14 @@ Private conversation-scoped instructions/context. Fields: `id`, `conversation_id
 - `integration_events`: inbox/outbox event ID, integration, external event ID, event type, aggregate ID, payload, status, attempt count, next retry, lease/lock expiry, error, timestamps. Unique inbound key `(integration, external_event_id)`. Workers claim events with expiring leases so crashed workers do not strand work; retries use backoff and permanent failures go to a dead-letter state.
 - `audit_events`: actor, action, entity, before/after state references, reason, metadata, timestamp. Capture admin replies, private context additions, fact corrections, transcript exports, handover transitions, and CRM mapping changes.
 
+Production support tables should also include `admin_users` (external identity subject, email, role, active flag; do not store plaintext passwords), `message_send_attempts` (each outbound attempt and ambiguous result), `agent_runs` (skill/release, model identifier, decision type, latency/token/cost/error metadata without hidden reasoning or duplicated transcript), and `transcript_exports` (requester, filters, redaction mode, status, private artifact reference, expiry, and download audit). `message_delivery_events` keeps append-only acknowledgement history while `messages.delivery_status` is the current projection. The coding-agent guide defines their required fields and write rules.
+
+For safe rollout, add persisted `runtime_controls` (mode, kill switch, actor, reason, version) and `ai_rollout_allowlist` records for canary contacts. Store unsent shadow/assisted output as a short-lived private draft, not a customer-visible message. The kill switch blocks AI sends in every mode; it does not block inbound capture or admin replies.
+
+Add `skill_review_runs` for each scheduled/manual analysis (input cohort/filter, reviewer skill/release, status, counts, timestamps, error, and output reference) and `skill_improvement_proposals` for each proposed change (run ID, affected skill key, issue category, de-identified evidence references, frequency/severity, proposed diff, regression-test artifact, status, reviewer/decision/time, and eventual code change/release reference). These are workflow records, not a database skill registry: source skills stay as Markdown files in version control.
+
+For media-capable conversations, add `message_attachments` metadata linked to `messages`; store binaries in private object storage with access checks, malware scanning, and retention controls rather than public URLs or database blobs by default. A message must still be retained if its media cannot be fetched or safely inspected.
+
 ## 7. Skill lifecycle and controlled learning
 
 1. Persist all customer-visible messages according to retention policy, including every admin reply and interactive message/selection. Link automated turns to the skill key and deployed release.
@@ -245,6 +258,8 @@ Private conversation-scoped instructions/context. Fields: `id`, `conversation_id
 5. Review and validate the change through code review and deployment, using representative/redacted conversation scenarios as appropriate.
 6. Deploy the application. New turns use the skill files from that release. In-progress conversations may use the current deployed skill on each turn; if consistent per-conversation behavior is required, pin a release identifier on conversation start.
 7. Monitor handover rate, option-selection/fallback rate, missing-field completion, corrections, and response quality; revert through a code change and deployment if needed.
+
+8. A configurable scheduled background job may run `skill_reviewer.md` against a de-identified cohort, group repeated failure patterns, and create proposals with regression tests. Require minimum cohort/frequency thresholds to avoid generalizing from one customer's case; allow a supervisor to launch a manual review. The reviewer must not write to `skills/`, change the active release, or send customer messages. A human approves/rejects the proposal in the admin review queue; approval means “ready for code implementation/review,” not “live.” The final skill change requires normal code review, CI, and deployment.
 
 Chats, including admin replies, are learning evidence; they are not themselves trusted instructions. Customer content must never be executed as a skill or allowed to override system/admin policy. Prefer reusable patterns over copying one-off promises or personal details into a shared skill.
 
@@ -271,6 +286,10 @@ Internal APIs use HTTPS, authenticated roles, authorization checks, request IDs,
 | `POST /api/handovers/{id}/context-notes` | Add private context for this conversation. Never sends a customer message. |
 | `POST /api/handovers/{id}/handback` | Explicitly return conversation to automation, optionally with admin summary. |
 | `POST /api/operations/transcript-exports` | Authorized, audited export of all or selected/date-bounded conversations, including admin-sent messages; de-identify by default and exclude private context. |
+| `POST /api/operations/skill-reviews` | Supervisor starts a review run for an allowed cohort; scheduled runs use the same policy and audit path. |
+| `GET /api/skill-improvement-proposals?status=pending_review` | List proposals with frequency, severity, affected skill, and test status. |
+| `GET /api/skill-improvement-proposals/{id}` | View redacted evidence references, proposed diff, generated regression tests, and run metadata. |
+| `POST /api/skill-improvement-proposals/{id}/decision` | Supervisor approves or rejects with a reason; approval queues a human code change and does not deploy it. |
 | `PATCH /api/contacts/{id}/context` | Admin correction to general context with provenance. |
 | `POST /api/contacts/{id}/requirements` | Create a buy/sell requirement. |
 | `PATCH /api/requirements/{id}` | Correct/update requirement fields and readiness. |
@@ -308,7 +327,9 @@ Internal APIs use HTTPS, authenticated roles, authorization checks, request IDs,
 
 ## 9. CRM synchronization and customer context mapping
 
-The application database is authoritative for message history, provenance, workflow, skill version, and structured context. The CRM is the sales team's operational record. The CRM adapter maps contacts and agreed requirement fields to CRM objects/fields, stores external IDs, and uses upserts to prevent duplicate leads.
+The application database is authoritative for message history, provenance, workflow, skill version, and structured context. The CRM is the sales team's operational record. For the MVP, default to one-way synchronization from the application to explicitly mapped CRM fields; record source and ownership rules for each field. Do not claim bi-directional sync until the selected CRM's inbound events, field ownership, deduplication, and conflict policy are implemented.
+
+The CRM adapter maps contacts and agreed requirement fields to CRM objects/fields, stores external IDs, and uses upserts to prevent duplicate leads.
 
 Before implementation, decide whether a buy requirement and sell mandate map to separate CRM leads/opportunities or one client record with related opportunities. Do not flatten multiple simultaneous requirements or portfolio holdings into a single free-text CRM note if structured custom fields/objects are available. Preserve source and timestamp for mapped values, define conflict rules for CRM edits, and avoid overwriting a verified human-entered value with a low-confidence extraction. CRM sync is asynchronous, retryable, observable, and does not block WhatsApp handling.
 
@@ -354,7 +375,7 @@ open-wa operates through WhatsApp Web rather than Meta's official WhatsApp Busin
 
 1. Which CRM and open-wa linked number/session are selected?
 2. Which roles are included under “admin,” and is the agent persona an automated assistant, human agent, or both? This proposal treats “agent” as the automated conversational agent and “admin” as the human operator.
-3. Which Markdown skills are needed at launch (buyer intake, seller intake, portfolio capture, FAQs)?
+3. Which customer-facing Markdown skills are needed at launch (buyer intake, seller intake, portfolio capture, FAQs), and who can approve skill-review proposals?
 4. What exactly triggers handover: unknown topic, low confidence threshold, customer request, contradictions, sensitive question, or all of these?
 5. Can admin context be applied to one turn or persist for the conversation, and when should it expire?
 6. Should an admin reply leave automation paused until explicit hand-back in every case? Proposed default: yes.
@@ -369,6 +390,7 @@ open-wa operates through WhatsApp Web rather than Meta's official WhatsApp Busin
 - Every structured fact has provenance and can be corrected without losing history.
 - A handover pauses automation; admin can reply or add private context; explicit hand-back resumes it. All admin customer-visible messages are persisted with delivery status.
 - Full conversation exports can include admin replies for controlled skill review; new skills are human-authored Markdown changes, reviewed and deployed rather than learned/published automatically.
+- `skill_reviewer.md` can analyze de-identified cohorts and draft recurring-issue fixes with regression tests; only a human-approved code change followed by CI/deployment affects production.
 - Skills live as Markdown files in version control and change through deployment; automated turns record the skill and release used.
 - Skills can request WhatsApp interactive lists/buttons where supported, while preserving free-text and fallback handling.
 - CRM create/update behavior is idempotent, mapped, retryable, and visible to admins.
