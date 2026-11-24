@@ -4,6 +4,8 @@
 **Scope:** WhatsApp automation using open-wa, a Python/uv/FastAPI application, CRM synchronization, and customer context mapping. Email is excluded.  
 **Future extension:** Match structured client requirements against UAE property assets. Inventory ingestion and matchmaking are later phases; this phase prepares compatible data and APIs without claiming to search live inventory.
 
+**Initial deployment assumption:** one business account/open-wa session. Keep account/session identifiers on provider-facing records so a future multi-account deployment can scope identities and idempotency keys correctly; do not imply multi-tenant isolation until it is implemented and tested.
+
 ## 1. Product model
 
 A customer starts or continues a WhatsApp conversation. A conversational agent uses the currently published set of skills to understand the customer's goal, ask relevant follow-up questions, and maintain a structured client context. The customer can be a buyer, seller, or both. The system stores the full chat history and maps facts from that history into CRM and customer context records.
@@ -77,14 +79,15 @@ For a buyer, the agent progressively captures property type, desired location(s)
 
 ## 5. Conversation states and rules
 
-Suggested states: `active_agent`, `admin_handover`, `admin_owned`, `awaiting_admin_handback`, `ready_for_matching`, and `closed`. `active_agent` means automated agent is permitted to respond. The state is on the conversation; a separate handover record captures each escalation. `ready_for_matching` is a qualification marker and need not stop conversation activity, so it may be better represented as a profile status rather than a mutually exclusive conversation state.
+Keep conversation state small and unambiguous: `active_agent`, `admin_owned`, and `closed`. An open `handover_case` is the source of truth for why automation is paused and whether admin action is pending. `ready_for_matching` belongs on a requirement's `match_readiness`, not on the conversation. The handover lifecycle can be `open`, `assigned`, `admin_owned`, `resolved`, or `handed_back`; only an explicit hand-back may transition the conversation to `active_agent`.
 
 Rules:
 
 - While a handover is open or an admin owns the conversation, automated customer-facing messages are blocked.
 - Admin direct replies are sent through the same outbound worker and stored as messages with `sender_type=admin`, including send result, delivery callbacks, and interactive content/selection.
 - Private context is stored separately from chat messages and is never rendered as customer-visible text. It may be supplied to the agent for this conversation after authorization.
-- Hand-back is explicit and audited. Silence, elapsed time, or a successful admin reply does not resume automation by itself.
+- Hand-back is explicit and audited. Silence, elapsed time, or a successful admin reply does not resume automation by itself. A customer opt-out updates contact consent and blocks automated outbound messages immediately; define the narrow policy for any necessary human response before launch.
+- At most one active processor may advance a conversation at a time. Use row-level locking or optimistic version checks, and re-check ownership immediately before enqueue/send so concurrent inbound messages and admin takeover cannot race an AI reply past the handover.
 - Every generated response references the skill key and deployed release or commit identifier used, for review and troubleshooting.
 - Facts are not silently overwritten by lower-confidence or contradictory extraction. Retain provenance and flag conflicts for clarification or admin review.
 - Skill content is shared configuration in Markdown. Changes go through code review and deployment; conversations may record the skill and release used for each automated turn.
@@ -123,7 +126,7 @@ Indexes: `(contact_id, updated_at DESC)`, `(state, updated_at)`, unique provider
 
 ### `messages`
 
-Append-only record of all inbound and outbound customer-visible chat messages. This includes every admin message sent after handover and all automated replies. Admin private context does not belong in this table.
+Append-only record of all inbound and outbound customer-visible chat messages. This includes every admin message sent after handover and all automated replies. Message content and actor are immutable; delivery state is a current projection updated by provider events, with each status change retained in `message_delivery_events`. Admin private context does not belong in this table.
 
 | Fields | Description |
 | --- | --- |
@@ -138,6 +141,10 @@ Append-only record of all inbound and outbound customer-visible chat messages. T
 | `delivery_status TEXT NULL` | `queued`, `sent`, `delivered`, `read`, `failed`, etc. |
 | `skill_key TEXT NULL`, `application_release TEXT NULL` | Skill and deployed release used for automated responses; null for admin/customer messages. |
 | `created_at TIMESTAMPTZ` | Ingestion/creation time. |
+
+### `message_delivery_events`
+
+Append-only status history for outbound messages. Fields: `id`, `message_id`, `provider_event_id`, `status`, `occurred_at`, `received_at`, `error_code`, and restricted `metadata_json`. Deduplicate provider events. Keep `messages.delivery_status` as the latest projection for efficient inbox display.
 
 ### `client_context`
 
@@ -217,7 +224,7 @@ The runtime maps these definitions to open-wa's supported interactive message fo
 
 ### `handover_cases`
 
-Fields: `id`, `conversation_id`, `status` (`open`, `admin_owned`, `resolved`, `handed_back`), `reason_code`, `reason_summary`, `trigger_message_id`, `assigned_admin_id`, `opened_at`, `resolved_at`, `handback_at`. One open handover per conversation, enforced transactionally.
+Fields: `id`, `conversation_id`, `status` (`open`, `assigned`, `admin_owned`, `resolved`, `handed_back`), `reason_code`, `reason_summary`, `trigger_message_id`, `assigned_admin_id`, `opened_at`, `resolved_at`, `handback_at`. One active handover per conversation, enforced transactionally. Record assignment and status changes in the audit log.
 
 ### `admin_context_notes`
 
@@ -226,7 +233,7 @@ Private conversation-scoped instructions/context. Fields: `id`, `conversation_id
 ### `crm_links`, `integration_events`, and `audit_events`
 
 - `crm_links`: internal contact/requirement IDs, CRM name, external contact/lead IDs, mapping status, last sync/error, timestamps. Use unique constraints on external IDs and internal-to-CRM mappings.
-- `integration_events`: inbox/outbox event ID, integration, external event ID, event type, aggregate ID, payload, status, attempt count, next retry, error, timestamps. Unique inbound key `(integration, external_event_id)`.
+- `integration_events`: inbox/outbox event ID, integration, external event ID, event type, aggregate ID, payload, status, attempt count, next retry, lease/lock expiry, error, timestamps. Unique inbound key `(integration, external_event_id)`. Workers claim events with expiring leases so crashed workers do not strand work; retries use backoff and permanent failures go to a dead-letter state.
 - `audit_events`: actor, action, entity, before/after state references, reason, metadata, timestamp. Capture admin replies, private context additions, fact corrections, transcript exports, handover transitions, and CRM mapping changes.
 
 ## 7. Skill lifecycle and controlled learning
@@ -255,7 +262,7 @@ Internal APIs use HTTPS, authenticated roles, authorization checks, request IDs,
 
 | Method / route | Purpose |
 | --- | --- |
-| `GET /api/conversations?state=admin_handover` | Admin queue and filters. |
+| `GET /api/conversations?handover_status=open` | Admin queue and filters. |
 | `GET /api/conversations/{id}` | Messages, current context, active requirements, portfolio, skill/version, CRM sync and handover state. |
 | `GET /api/contacts/{id}/context` | Client context, requirements, portfolio, provenance, CRM link. |
 | `POST /api/conversations/{id}/messages` | Admin sends a direct WhatsApp reply; persist and send through outbound worker. |
@@ -312,14 +319,22 @@ Current phase stores requirements in a normalized shape that a later asset catal
 ## 11. Reliability, security, and privacy
 
 - Validate the open-wa webhook secret and use event/message IDs for idempotency; keep the open-wa API key private.
+- Place open-wa and the application on a private network; use HTTPS for traffic crossing trust boundaries, constant-time secret comparison, request size limits, rate limits, and strict event schema validation. Do not expose open-wa health/dashboard endpoints publicly.
 - Persist inbound events and state changes before acknowledging or triggering external side effects; dispatch sends/CRM writes through an outbox.
+- Configure open-wa webhook delivery durability where available and monitor its pending/dead-letter queue. Python-side persistence remains the durable system of record; webhook delivery is at-least-once, so the receiver must deduplicate.
 - Preserve per-conversation ordering where possible and guard state transitions against races.
 - Block AI outbound sends transactionally when a handover/admin ownership is active.
+- Treat outbound WhatsApp sends as potentially ambiguous: a timeout may occur after delivery. Record the attempt and reconcile using provider IDs/status events before retrying; avoid duplicate customer messages.
 - Use bounded retries and dead-letter queues; show failures to admins with safe retry controls.
-- Encrypt data in transit and at rest; use role-based access for admin, agent, and service identities; keep secrets in a managed secret store.
-- Define customer consent, opt-out, access, deletion, and retention policies before launch. Chat retention must be long enough for the stated learning/review purpose and bounded by policy.
+- Encrypt data in transit and at rest; use least-privilege role-based access for admin and service identities; require MFA for admin access when supported; keep secrets in a managed secret store and rotate them.
+- Escape customer-controlled content in the admin UI, protect state-changing browser requests against CSRF, and avoid rendering untrusted message markup or links as trusted UI.
+- Define customer consent, opt-out, access, deletion, and retention policies before launch. Chat retention must be long enough for the stated learning/review purpose and bounded by policy. A deletion request should remove or anonymize eligible customer content across systems; immutable audit records should retain only the minimum non-content evidence required by the approved policy.
+- Define deletion/anonymization behavior across messages, CRM mappings, exports, logs, and backups. Any legal/operational retention exception must be explicit; transcript learning use must respect approved purpose and retention.
 - Restrict private admin context to the relevant conversation and authorized service calls. Record access and changes.
 - Minimize model context to relevant messages and facts. Treat chats as untrusted input; do not let them change skills, policies, tools, or permissions.
+- Validate model output against strict schemas and allowlisted actions. The model proposes facts and reply drafts; application code enforces state, permissions, handover, consent, send policy, and CRM writes. Never let model output directly execute arbitrary tools or SQL.
+- Set model timeouts, bounded retries, per-conversation rate limits, token/cost budgets, and a no-model safe fallback that pauses/escalates rather than sending unsupported answers.
+- Maintain redacted evaluation cases for buyer, seller, ambiguity, contradiction, prompt injection, unknown questions, and admin hand-back. Compare skill/model releases before rollout and monitor handover, correction, opt-out, and complaint signals.
 - Keep logs focused on IDs, state, timings, and error codes; avoid logging full message bodies, admin notes, tokens, or unnecessary personal data.
 
 open-wa operates through WhatsApp Web rather than Meta's official WhatsApp Business Platform API. Treat it as a separate, self-hosted integration with a persistent linked-device session, and assess account, operational, and terms-of-service risk before production. Keep the open-wa API private, use its API key and a shared secret for webhooks, persist/recover its session safely, and design for reconnects and duplicate event delivery. Interactive messages require an applicable open-wa license; verify license entitlements and test supported message types before committing to list/button/Flow-based UX. Provide a text fallback.

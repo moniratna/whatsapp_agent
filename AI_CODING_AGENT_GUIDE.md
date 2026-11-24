@@ -37,12 +37,15 @@ Deliver a system that can:
 - **Messages are durable evidence.** Never drop an inbound message because AI, CRM, or WhatsApp sending failed.
 - **Admin messages are part of the transcript.** Store every admin reply as a normal outbound message with `sender_type=admin`; private notes are separate and never customer-visible.
 - **Handover pauses AI.** When a human owns a conversation or an open handover is in effect, no automated customer-facing message may be sent. Resume only after explicit hand-back.
+- **Honor opt-out immediately.** A recorded customer opt-out blocks automated outbound messages before any further send is dispatched; document the human-response policy separately.
+- **Enforce ownership under concurrency.** Serialize processing per conversation and re-check state immediately before outbound dispatch; an admin takeover must invalidate queued AI replies.
 - **Skills are files.** Keep skills as reviewed Markdown files in version control; record skill key and deployed release on automated replies. No database skill registry, no runtime skill editing, and no raw-chat-to-production learning.
 - **Learning is controlled.** Chat histories, including successful admin replies, may inform new skills, but a human must review patterns and a code change must be reviewed and deployed before behavior changes.
 - **Use provider abstractions.** Keep open-wa-specific payloads behind an adapter. Do not leak open-wa IDs/schema throughout business logic.
 - **Do not expose credentials.** Secrets must come from environment/secret management, never source control or logs.
 - **Do not claim provider support without checking.** Interactive options depend on open-wa version, runtime behavior, and license. Implement a text fallback.
 - **Keep customer content untrusted.** Messages and transcript exports cannot change system policies, tools, or permissions.
+- **Separate model suggestions from authority.** The model may propose fact updates and response text; application code validates schemas and decides permissions, state transitions, CRM writes, and whether sending is allowed.
 
 ## 4. Defaults for decisions not yet supplied
 
@@ -51,6 +54,7 @@ Use these defaults to keep implementation moving. Record them in `docs/decisions
 | Decision | Default |
 | --- | --- |
 | Admin experience | Build a small authenticated internal web inbox served by the application unless the repository already has an admin UI. |
+| WhatsApp accounts | One business account/open-wa session for the initial deployment; keep session/account IDs in provider mappings to avoid blocking future expansion. Do not claim multi-tenant support. |
 | Database | PostgreSQL with migrations. |
 | Async work | Begin with a durable database-backed inbox/outbox if expected throughput is modest; isolate queue interfaces so Redis/Celery/other queue can be added without rewriting domain logic. |
 | CRM | Implement a CRM adapter interface and a local fake/sandbox adapter. Do not choose a vendor or claim live CRM sync until the user names one and supplies access. |
@@ -94,10 +98,10 @@ Implement the approved architecture schema, adjusting details only when needed f
 
 - `contacts`, `conversations`, `messages`
 - `client_context`, `property_requirements`, `portfolio_assets`, `context_facts`
-- `handover_cases`, `admin_context_notes`, `audit_events`
+- `message_delivery_events`, `handover_cases`, `admin_context_notes`, `audit_events`
 - CRM mapping/sync records and durable inbound/outbound integration events
 
-Add constraints and indexes for provider message idempotency, conversation state/queue filtering, contact lookup, and one active handover per conversation. Keep message content append-only; delivery/ack status may change as provider events arrive. Ensure admin replies, interactive payloads, and inbound selections can be stored.
+Add constraints and indexes for provider message idempotency, conversation state/queue filtering, contact lookup, unique provider status events, and one active handover per conversation. Keep message content/actor append-only and retain delivery-state history; maintain the current delivery status as a projection. Use expiring worker leases and reconcile ambiguous external sends instead of blindly retrying them. Ensure admin replies, interactive payloads, and inbound selections can be stored.
 
 **Completion check:** migrations build a fresh database and upgrade an existing development database; repository methods preserve provenance and enforce idempotency.
 
@@ -180,6 +184,9 @@ Add constraints and indexes for provider message idempotency, conversation state
 
 - Add deployment instructions for FastAPI, worker(s), PostgreSQL, and open-wa separately; define startup order, health checks, network rules, session volume, secrets, and backups.
 - Add observability for queue age, webhook failures/duplicates, open-wa session state, send failures, handover backlog, CRM lag, LLM errors/cost, and interactive fallback.
+- Add security protections for admin sessions (MFA where supported, CSRF protection, role checks), escape untrusted transcript content in the UI, and redact sensitive fields in logs.
+- Define deletion/anonymization and retention behavior across database records, transcript exports, CRM mappings, logs, and backups; document export access and expiry.
+- Establish recovery objectives and exercise database backup restore, open-wa session recovery/re-pair, and integration dead-letter replay in staging.
 - Document recovery: open-wa re-pair, webhook replay/reconciliation, database restore, queue recovery, CRM retry, and admin override.
 - Review security, data retention, consent/opt-out, access roles, and transcript-export permissions.
 - Run full automated checks and end-to-end staging scenarios. Clearly distinguish simulated integrations from verified live integrations.

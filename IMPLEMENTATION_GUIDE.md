@@ -34,6 +34,7 @@ Before implementation begins, record decisions for:
 
 - CRM product, authentication method, object model, custom fields, and conflict rules.
 - WhatsApp number/device that will be linked, who owns the device, and how session recovery will work.
+- Initial deployment is one business account/session; record this as a scope boundary and keep provider session IDs in stored mappings.
 - open-wa deployment model, version pinning, license tier, and accepted operational/account risk.
 - Admin identity/authentication and whether the admin inbox is a new UI or an existing CRM surface.
 - Initial Markdown skills, language(s), currencies, UAE location vocabulary, and requirement completeness criteria.
@@ -131,9 +132,9 @@ The open-wa Easy API may be run from its generated Node.js project or deployment
 ### Stage 4 — Admin inbox and handover
 
 1. Add admin authentication and role-based authorization.
-2. Build a review queue for `admin_handover` conversations with reason, latest message, contact context, CRM sync status, and full transcript.
+2. Build a review queue from open/assigned `handover_cases` with reason, latest message, contact context, CRM sync status, and full transcript.
 3. Add assignment, takeover, direct text reply, private context note, and explicit hand-back actions.
-4. Persist admin replies as normal outbound messages with `sender_type=admin`, actor identity, open-wa message ID, and acknowledgement/delivery status.
+4. Persist admin replies as normal outbound messages with `sender_type=admin`, actor identity, open-wa message ID, and acknowledgement/delivery status history.
 5. Keep internal context notes in their separate table; never expose them in the WhatsApp transcript or outbound payload accidentally.
 6. Enforce a concurrency-safe pause: no assistant send may pass the final state check once a handover/admin ownership is active.
 7. Require an explicit admin hand-back before AI resumes; record who handed back, when, and any summary.
@@ -182,7 +183,7 @@ The open-wa Easy API may be run from its generated Node.js project or deployment
 1. Select the LLM/provider and implement a narrow extraction contract for intent, candidate facts, confidence, missing fields, and escalation reason.
 2. Load only relevant recent messages, structured context, applicable skill, and conversation-scoped admin context. Never treat customer transcript text as trusted instructions.
 3. Add response policy: only answer from approved skill/context; no invented inventory, price, legal/financial, or availability claims; unknown or sensitive questions trigger handover.
-4. Before send, re-check conversation state and opt-out state transactionally. Cancel queued AI sends if admin takeover happened after generation.
+4. Before send, re-check conversation ownership and opt-out state transactionally. Cancel queued AI sends if admin takeover happened after generation or the customer opted out. Define the approved exception, if any, for human replies after opt-out.
 5. Save the generated response, skill/release, and relevant decision metadata before sending through the outbox.
 6. Add rate limits, token/cost limits, timeout handling, and a safe fallback when model/extraction calls fail.
 
