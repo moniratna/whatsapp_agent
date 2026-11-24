@@ -8,7 +8,7 @@
 
 A customer starts or continues a WhatsApp conversation. A conversational agent uses the currently published set of skills to understand the customer's goal, ask relevant follow-up questions, and maintain a structured client context. The customer can be a buyer, seller, or both. The system stores the full chat history and maps facts from that history into CRM and customer context records.
 
-Skills are versioned instruction/configuration bundles (for example, `buyer_intake`, `seller_intake`, `portfolio_capture`, and `general_uae_property_faq`). They guide what to ask and how to handle a domain. Conversation transcripts are retained as evidence and as material for an admin to review when proposing new or improved skills. Chats must not automatically rewrite or publish skills: an admin reviews, tests, versions, and publishes changes. This keeps learning auditable and prevents one customer's conversation from silently changing behavior for everyone.
+Skills are Markdown files in the code repository (for example, `buyer_intake.md`, `seller_intake.md`, `portfolio_capture.md`, and `general_uae_property_faq.md`). They guide what to ask and how to handle a domain. Conversation transcripts are retained as material for the team to review when proposing improved skills. A skill change is reviewed, committed, and deployed with the application; chats do not automatically rewrite skills. Git history and the deployed application release provide the skill change history.
 
 When the agent cannot answer confidently, encounters an unknown question, or needs an admin decision, it pauses automated replies and creates a handover. An admin can send a direct WhatsApp reply, provide private context for the assistant to use, or do both. The system records which action happened. The assistant resumes only after an explicit admin hand-back. Private admin context is not sent to the customer unless the admin deliberately turns it into a reply.
 
@@ -21,7 +21,7 @@ flowchart LR
     WH --> IN[(Inbound event store / queue)]
     IN --> ORCH[Conversation orchestrator]
     ORCH <--> DB[(Customer context and chat database)]
-    ORCH --> SK[Published skill registry]
+    ORCH --> SK[Markdown skills in deployed application]
     SK --> ORCH
     ORCH <--> AI[LLM / extraction and response]
     ORCH -->|answer / follow-up| OUT[Outbound message worker]
@@ -60,7 +60,7 @@ For a buyer, the agent progressively captures property type, desired location(s)
 | WhatsApp adapter | Provider-specific webhook verification, payload normalization, outbound sends, template/session enforcement, and delivery callbacks. |
 | Webhook ingress | Fast validation and durable event acceptance; deduplication and queue handoff. |
 | Conversation orchestrator | State machine; contact resolution; skill selection; context loading; extraction, response, handover, and CRM event decisions. |
-| Skill registry | Draft, tested, published, and retired skill versions with scope, prompts/instructions, required fields, escalation rules, and change history. |
+| Skill files | Markdown instructions maintained in version control, reviewed with code changes, and loaded by the deployed application. Each deployment has a release/commit identifier. |
 | Extraction/response service | Converts messages to candidate structured facts and generates constrained responses using only permitted context and skill instructions. |
 | Admin console/API | Review chat and context, manage handover, reply directly, add private conversation context, correct facts, and review/publish skill versions. |
 | Context database | Contacts, conversations, immutable message history, facts, current requirements, portfolio, skill usage, handovers, and audit records. |
@@ -78,7 +78,7 @@ Rules:
 - Admin direct replies are sent through the same outbound worker and stored as messages with `sender_type=admin`.
 - Private context is stored separately from chat messages and is never rendered as customer-visible text. It may be supplied to the agent for this conversation after authorization.
 - Hand-back is explicit and audited. Silence, elapsed time, or a successful admin reply does not resume automation by itself.
-- Every generated response references the skill version and context/facts used, for review and troubleshooting.
+- Every generated response references the skill file/key and deployed release or commit identifier used, for review and troubleshooting.
 - Facts are not silently overwritten by lower-confidence or contradictory extraction. Retain provenance and flag conflicts for clarification or admin review.
 - Skill content is shared configuration. Only authorized admins can publish a new version; conversations may record the version used for each turn.
 
@@ -185,10 +185,11 @@ Provenance and history for structured field values, including requirements, port
 
 Fields: `id UUID PK`, `contact_id UUID FK`, `entity_type TEXT`, `entity_id UUID`, `field_key TEXT`, `value_json JSONB`, `confidence NUMERIC(4,3) NULL`, `source_type TEXT` (`customer_message`, `admin`, `agent_extraction`), `source_message_id UUID NULL`, `created_by TEXT NULL`, `valid_from TIMESTAMPTZ`, `superseded_at TIMESTAMPTZ NULL`, `created_at TIMESTAMPTZ`. Keep customer statements distinguishable from inferred facts and admin corrections.
 
-### `skills` and `skill_versions`
+### Skill files and release traceability
 
-`skills`: `id`, `key UNIQUE`, `name`, `description`, `status`, `created_at`, `updated_at`.  
-`skill_versions`: `id`, `skill_id`, `version`, `instructions`, `required_fields JSONB`, `triggers JSONB`, `escalation_rules JSONB`, `status` (`draft`, `testing`, `published`, `retired`), `created_by`, `approved_by`, `published_at`, `created_at`. Unique `(skill_id, version)`. Published versions are immutable; edits create a new version.
+Skills are repository Markdown files, not database records. Store them in a predictable directory such as `skills/`, with a short metadata header for the skill key, intent, and applicable workflow. The deployed application loads these files; deployment, not a database publish action, changes active skill behavior. Keep review and testing in the normal code review/deployment process.
+
+For traceability, record `skill_key`, `skill_file_path` (or stable key only), and `application_release` (commit SHA or release ID) on automated assistant turns/messages. The content itself remains in version control. This avoids duplicating skill text in the database while allowing the team to identify the exact deployed instructions used for a response.
 
 ### `handover_cases`
 
@@ -206,12 +207,12 @@ Private conversation-scoped instructions/context. Fields: `id`, `conversation_id
 
 ## 7. Skill lifecycle and controlled learning
 
-1. Persist every chat message according to retention policy and link automated turns to skill versions.
+1. Persist every chat message according to retention policy and link automated turns to the skill key and deployed release.
 2. Admins review unresolved questions, corrections, repeated follow-ups, and useful conversation patterns. A future reporting view can group these without exposing more personal information than needed.
-3. Admin drafts or edits a skill with its purpose, trigger conditions, instructions, required fields, examples, and escalation rules.
-4. Run offline scenarios/redacted transcript cases against the draft and review outputs. A second-person approval can be added if governance requires it.
-5. Publish a new immutable version. New turns use it according to routing rules; in-progress conversations can remain pinned to their prior version or upgrade explicitly.
-6. Monitor handover rate, missing-field completion, corrections, and response quality; retire or roll back a version if it performs poorly.
+3. An authorized developer updates the relevant Markdown skill file in version control, including its purpose, trigger conditions, instructions, required fields, examples, and escalation rules.
+4. Review and validate the change through the team's code review and deployment process, using representative/redacted conversation scenarios as appropriate.
+5. Deploy the application. New turns use the skill files from that release. In-progress conversations may use the current deployed skill on each turn; if consistent per-conversation behavior is required, pin a release identifier on conversation start.
+6. Monitor handover rate, missing-field completion, corrections, and response quality; revert the skill change through a code change and deployment if needed.
 
 Chats are learning evidence; they are not themselves trusted instructions. Customer content must never be executed as a skill or allowed to override system/admin policy.
 
@@ -242,17 +243,6 @@ Internal APIs use HTTPS, authenticated roles, authorization checks, request IDs,
 | `PATCH /api/requirements/{id}` | Correct/update requirement fields and readiness. |
 | `POST /api/contacts/{id}/portfolio-assets` | Add a customer-shared current property. |
 | `PATCH /api/portfolio-assets/{id}` | Correct portfolio details/status. |
-
-### Skill administration APIs
-
-| Method / route | Purpose |
-| --- | --- |
-| `GET /api/skills` | List skill keys, active versions, and status. |
-| `POST /api/skills` | Create a skill definition (admin role). |
-| `POST /api/skills/{id}/versions` | Create a draft version; existing published versions remain immutable. |
-| `POST /api/skill-versions/{id}/test` | Run approved test scenarios and return results. |
-| `POST /api/skill-versions/{id}/publish` | Publish a reviewed version (admin authorization and audit). |
-| `POST /api/skill-versions/{id}/retire` | Retire a version and route to a replacement or safe fallback. |
 
 ### CRM and operational APIs
 
@@ -314,7 +304,7 @@ Confirm current WhatsApp provider rules for customer service windows, templates,
 2. Review schema, CRM mapping, skill governance, handover triggers, and state transitions.
 3. Implement webhook ingestion, message persistence, contact/conversation resolution, admin inbox, direct replies, pause, and hand-back.
 4. Add structured extraction for buyer/seller requirements, portfolio, and general context with provenance and admin corrections.
-5. Add skill registry/version lifecycle and controlled draft-test-publish flow.
+5. Add Markdown skill loading and deployed-release traceability; skill updates use the normal code review and deployment process.
 6. Add CRM synchronization, retries, and reconciliation.
 7. Pilot with human review enabled; monitor errors, handovers, corrections, completeness, and customer experience.
 8. In a separate phase, ingest UAE assets and build/review matchmaking.
@@ -323,7 +313,7 @@ Confirm current WhatsApp provider rules for customer service windows, templates,
 
 1. Which CRM and WhatsApp provider/business number are selected?
 2. Which roles are included under “admin,” and is the agent persona an automated assistant, human agent, or both? This proposal treats “agent” as the automated conversational agent and “admin” as the human operator.
-3. Which skills are needed at launch (buyer intake, seller intake, portfolio capture, FAQs)?
+3. Which Markdown skills are needed at launch (buyer intake, seller intake, portfolio capture, FAQs)?
 4. What exactly triggers handover: unknown topic, low confidence threshold, customer request, contradictions, sensitive question, or all of these?
 5. Can admin context be applied to one turn or persist for the conversation, and when should it expire?
 6. Should an admin reply leave automation paused until explicit hand-back in every case? Proposed default: yes.
@@ -337,6 +327,6 @@ Confirm current WhatsApp provider rules for customer service windows, templates,
 - Buy requirements, sell requirements, current portfolio, and other shared context are distinct structured data.
 - Every structured fact has provenance and can be corrected without losing history.
 - A handover pauses automation; admin can reply or add private context; explicit hand-back resumes it.
-- Skill changes are reviewed, versioned, tested, and attributable; raw chats do not self-publish instructions.
+- Skills live as Markdown files in version control and change through deployment; automated turns record the skill and release used; raw chats do not self-publish instructions.
 - CRM create/update behavior is idempotent, mapped, retryable, and visible to admins.
 - Structured requirements are suitable for a future UAE asset matcher without implying inventory availability today.
