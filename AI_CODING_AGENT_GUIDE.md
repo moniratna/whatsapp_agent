@@ -525,6 +525,14 @@ To establish this evidence, use each `agent_runs.known_fact_ids_json` and `reque
 
 Keep messages, provenance, workflow, skill release, and structured requirements authoritative in the application database. Treat Zoho as the sales team's operational CRM, with application-to-CRM writes only for explicitly mapped fields in the MVP. Preserve multiple independent buy/sell requirements and multiple portfolio properties. Record field ownership and source/timestamp; do not implement bidirectional conflict resolution until a separate CRM inbound-event and ownership policy exists. CRM sync is asynchronous and must never block WhatsApp intake, storage, or admin replies.
 
+### Current local-testing scope and recorded deviations
+
+- The user will run open-wa on a separate server. This repository implements the authenticated app-side webhook/client adapter; the Python app does not require the transport service to be installed on the same host.
+- Until the business approves a human-response policy after opt-out, the conservative behavior blocks every outbound send to an opted-out contact, including admin sends. Exact opt-in commands are recorded and an admin correction is audited; a separate explicit hand-back is still required to resume AI.
+- The first skill-review worker aggregates de-identified handover reason codes only. It enforces the configured distinct-conversation threshold and creates review-only proposals; it does not submit raw transcripts to an LLM or run model-generated code. Expanding the analysis requires privacy/security review.
+- Local end-to-end automated sends use an explicitly selected fake transport and synthetic provider IDs. Runtime defaults remain `shadow` with the kill switch on. Live sending is not verified.
+- The local-testing push targets milestones 0–9. Milestone 10 production-readiness work is deferred at the user's direction; the operations document records remaining staging and activation prerequisites.
+
 ## 7. API behavior requirements
 
 Implement the following API behavior. Route names are the initial contract and may be extended consistently as implementation requires:

@@ -1,0 +1,24 @@
+services:
+  openwa:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - openwa-sessions:/sessions
+    environment:
+      WA_SESSION_ID: ${WA_SESSION_ID:?Set WA_SESSION_ID}
+      WA_SESSION_DATA_PATH: /sessions
+      WA_API_KEY: ${WA_API_KEY:?Set WA_API_KEY in the deployment secret store}
+      OPENWA_WEBHOOK_SECRET: ${OPENWA_WEBHOOK_SECRET:?Set OPENWA_WEBHOOK_SECRET in the deployment secret store}
+      OPENWA_WEBHOOK_URL: ${OPENWA_WEBHOOK_URL:?Set a private FastAPI webhook URL}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  openwa-sessions:
