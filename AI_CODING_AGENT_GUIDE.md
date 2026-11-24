@@ -1,6 +1,6 @@
 # AI Coding Agent Guide — WhatsApp Real Estate Assistant
 
-This document is the self-contained execution brief for an AI coding agent implementing the project from an empty or partially prepared repository through a usable production deployment. It includes the database contract, implementation sequence, and acceptance criteria. Read it with [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`IMPLEMENTATION_GUIDE.md`](IMPLEMENTATION_GUIDE.md) for product rationale and rollout context; do not treat references to those files as a substitute for the requirements recorded here.
+This is the sole project brief an AI coding agent needs. It contains the product scope, architecture, database contract, APIs, integration decisions, implementation stages, operational safeguards, and acceptance criteria. Treat it as authoritative and self-contained.
 
 ## 1. Assignment
 
@@ -12,8 +12,40 @@ The user has selected:
 - **FastAPI** for HTTP APIs and webhook ingress.
 - **open-wa Easy API** for WhatsApp connectivity. It runs as a separate Node.js service; do not replace it with the official WhatsApp API or another provider without the user's direction.
 - **Markdown files in version control** for skills. Skill updates take effect through review and deployment; do not build a database skill editor/registry or self-modifying production skills.
+- **Amazon Bedrock** for LLM inference, using Bedrock API key bearer-token authentication.
+- **Zoho CRM API v8** for CRM synchronization, using OAuth 2.0.
 
-Use the two architecture documents as the source of product scope and proposed data model. Where details remain undecided, use the defaults below, make the choice visible in configuration/docs, and continue implementation. Ask the user only when an external decision or credential is a true blocker; continue unrelated work while waiting.
+Where details remain undecided, use the defaults below, make the choice visible in configuration/docs, and continue implementation. Ask the user only when an external decision or credential is a true blocker; continue unrelated work while waiting.
+
+### Architecture at a glance
+
+```mermaid
+flowchart LR
+    C[Customer] <-->|WhatsApp Web session| WA[WhatsApp]
+    WA <--> OW[open-wa Easy API\nseparate Node.js service]
+    OW -->|authenticated webhook| WH[FastAPI ingress]
+    WH --> IN[(Durable inbox / queue)]
+    IN --> ORCH[Conversation orchestrator]
+    ORCH <--> DB[(PostgreSQL: chat + client context)]
+    ORCH <--> SK[Deployed Markdown skills]
+    ORCH <--> BR[Amazon Bedrock]
+    ORCH --> OUT[Transactional outbox / workers]
+    OUT -->|HTTP + API key| OW
+    ORCH -->|unknown / low confidence| HO[Handover case]
+    HO --> ADM[Authenticated admin operations API]
+    ADM -->|reply / private context / hand-back| ORCH
+    ORCH --> CRM[Zoho CRM adapter]
+    CRM --> Q[(CRM sync outbox)]
+    Q --> Z[Zoho CRM API v8]
+    DB -->|approved de-identified chats| SR[Offline skill reviewer job]
+    SR --> PROP[(Review runs and proposals)]
+    PROP --> ADM
+    ADM -->|human approval| CODE[Code review + CI + deployment]
+    CODE --> SK
+    DB --> FUT[Future UAE asset matcher]
+```
+
+The Python application owns product behavior, persistence, context mapping, skills, and admin workflows. open-wa owns the linked WhatsApp Web session and transport operations. PostgreSQL is the durable system of record for messages, structured client context, workflow state, provenance, and integration events. The diagram's future matcher is only a downstream consumer; inventory ingestion and recommendations are out of scope.
 
 ## 2. Product outcome
 
@@ -26,7 +58,7 @@ Deliver a system that can:
 5. Pause automation and hand unknown/low-confidence/sensitive questions to an admin.
 6. Let an admin review context and messages, send direct WhatsApp messages (including supported interactive messages), add private context, and explicitly hand the conversation back.
 7. Persist every customer-visible message, including admin messages after handover, with actor, provider identifiers, send result, and delivery/acknowledgement state where available.
-8. Synchronize contacts and requirements to the selected CRM safely, with idempotency, retries, and visible status.
+8. Synchronize contacts and requirements to Zoho CRM safely, with idempotency, retries, and visible status.
 9. Export all or selected conversations, including admin replies, for controlled skill review. Exports must be access controlled, audited, and de-identified by default; exclude private admin notes by default.
 10. Prepare structured requirements for a future UAE property asset matcher. Do not build inventory ingestion or matchmaking in this project phase.
 
@@ -46,6 +78,63 @@ Deliver a system that can:
 - **Do not claim provider support without checking.** Interactive options depend on open-wa version, runtime behavior, and license. Implement a text fallback.
 - **Keep customer content untrusted.** Messages and transcript exports cannot change system policies, tools, or permissions.
 - **Separate model suggestions from authority.** The model may propose fact updates and response text; application code validates schemas and decides permissions, state transitions, CRM writes, and whether sending is allowed.
+
+### Future UAE inventory/matching contract (not implemented now)
+
+The current normalized `property_requirements` records are the future matcher input. A later inventory phase must define its inventory source, refresh cadence, usage/licensing permission, stable asset identifiers, and normalized asset schema. A matcher may compare transaction type, location, property type, budget/currency, bedrooms/area, timing, and preferences, then return candidates with match reasons and inventory freshness. Until that separate phase is approved and built, do not add inventory tables, search endpoints, asset recommendations, or claims that properties are available.
+
+### End-to-end WhatsApp flow
+
+1. A customer message arrives through the linked open-wa session. FastAPI authenticates and validates the webhook, normalizes it, deduplicates it, and durably stores it before acknowledging receipt.
+2. Resolve the contact by WhatsApp number plus provider account/session. Create a contact and conversation when needed. Queue processing without holding a database transaction open across network or model calls.
+3. Load the latest structured context, relevant bounded transcript, current deployed skill files, consent, and conversation ownership. Classify intent as buy, sell, portfolio, general, unknown, or mixed.
+4. Extract candidate facts with source-message references and confidence. Validate them and update the current structured projection plus append-only provenance history. Ask a useful missing/clarifying question without asking again for a known field unless it conflicts or is stale.
+5. If supported and licensed, send a skill-defined WhatsApp list or reply-button interaction with stable option IDs; accept free-text answers too. If unsupported, send the equivalent text prompt.
+6. Queue mapped CRM updates asynchronously. CRM failure must not discard the message, block a customer reply, or create duplicate records on retry.
+7. Answer only when the skill/context provides adequate support. Unknown, low-confidence, contradictory, sensitive, or explicitly human-requested cases create a handover and pause automated sends.
+8. An admin reviews the conversation, context, skill/release, CRM state, and handover reason. Admin can send a direct customer message, add private conversation context, or both. Every customer-visible admin message is written to the same transcript and sent through the outbound worker.
+9. Only explicit hand-back resumes automation. Private context is available only to authorized processing for that conversation and is never sent to the customer unless intentionally composed as a direct reply.
+10. Requirements that meet the agreed completeness rules can be marked ready for future matching; this phase does not search or recommend inventory.
+
+### System component responsibilities
+
+| Component | Responsibility |
+| --- | --- |
+| open-wa Easy API | Separate Node.js process for WhatsApp Web session, QR pairing, inbound event delivery, and outbound WhatsApp operations. Keep its API private. |
+| FastAPI transport adapter and webhook ingress | Authenticate webhook, validate/normalize open-wa payloads, accept events durably/idempotently, call open-wa with its API key, and normalize acknowledgements. |
+| Conversation orchestrator | Contact resolution, state machine, context loading, skill selection, Bedrock request, extraction validation, handover, and CRM event decisions. |
+| Markdown skills | Human-authored version-controlled instructions, deployed with the application. Each automated turn records the skill key and release. |
+| Bedrock adapter | Constrained extraction/response generation through Bedrock Runtime; no direct database, CRM, or WhatsApp authority. |
+| Admin operations API | Authenticated transcript/context retrieval, queue/takeover, direct replies, private context, fact corrections, hand-back, exports, proposal review, and runtime controls. |
+| Zoho CRM adapter/worker | Explicit field mapping, OAuth refresh, idempotent create/update, retry, reconciliation, and observable sync state. |
+| Inbox/outbox workers | Durable, leased, ordered processing with retries and dead-letter handling for inbound work, WhatsApp sends, CRM synchronization, and offline skill review. |
+| Offline skill reviewer | Reads only approved de-identified cohorts and `skill_reviewer.md`; drafts findings/diffs/tests as proposals and cannot edit skills, send messages, merge, or deploy. |
+
+### Repository layout target
+
+Adapt to existing repository conventions, but keep these boundaries recognizable:
+
+```text
+pyproject.toml                 # uv-managed Python package and tooling
+uv.lock                        # reproducible dependencies
+app/api/                       # FastAPI routes and request/response models
+app/config/                    # typed settings and environment parsing
+app/db/                        # ORM/models, migrations, repositories
+app/integrations/openwa/       # open-wa normalization and HTTP client
+app/integrations/bedrock/      # Bedrock Runtime adapter
+app/integrations/zoho/         # Zoho CRM adapter and field mapping
+app/conversations/             # state machine, orchestration, extraction
+app/skills/                    # Markdown loader, validation, routing
+app/workers/                   # inbox/outbox and scheduled review jobs
+app/admin/                     # admin services and authorization
+skills/                        # buyer/seller/portfolio/general/reviewer .md files
+migrations/                    # versioned schema changes
+tests/                         # unit, integration, security, and evaluation tests
+deploy/openwa/                 # pinned Easy API deployment/configuration
+docs/                          # runbooks, decisions, API/environment references
+```
+
+The open-wa Easy API may use its generated Node.js project/image and is not a Python dependency. Pin its release and keep its deployment configuration alongside the application or in its infrastructure repository.
 
 ## 4. Defaults for decisions not yet supplied
 
@@ -74,11 +163,11 @@ Use these defaults to keep implementation moving. Record them in `docs/decisions
 - **Failure behavior:** Both adapters use bounded timeouts, retry only transient/rate-limit/server errors with backoff and jitter, respect provider retry guidance, and send permanent failures to a visible dead-letter state. Idempotency keys and local sync records prevent duplicate CRM records. A provider outage must not lose inbound messages or admin replies. Missing production secrets must fail readiness checks; fake adapters remain available only in explicitly selected local/test modes.
 - **Configuration:** Provide `.env.example` with variable names and safe placeholders only. Validate required settings at startup/readiness without printing secret values. Keep local `.env` out of version control and document deployment secret-manager injection and rotation.
 
-When credentials are not supplied, finish the integration through its interface and fake adapter, and report the exact credentials/authorization needed to activate live Bedrock or Zoho. The provider choices themselves are fixed: Bedrock and Zoho.
+When credentials are not supplied, finish the integration through its provider port and fake adapter, and report the exact credentials/authorization needed to activate live Bedrock or Zoho. The provider choices themselves are fixed: Bedrock and Zoho.
 
 ## 5. Repository and engineering workflow
 
-1. Inspect the repository, existing instructions (`AGENTS.md`, project configuration), and both architecture documents before changing files.
+1. Inspect the repository and existing instructions (`AGENTS.md`, project configuration) before changing files. This guide contains all product and architecture requirements; do not require the other project markdown files.
 2. Preserve existing user work. Do not overwrite or remove files without understanding their purpose.
 3. Establish a concise `docs/decisions.md`, `README.md`, and environment example with placeholders only.
 4. Create the smallest coherent implementation slice, then run its relevant format, static checks, and tests. Add tests for new behavior; do not report checks that were not run.
@@ -91,6 +180,15 @@ When credentials are not supplied, finish the integration through its interface 
 
 ## 6. Required implementation sequence
 
+### Milestone 0 — Repository and integration preflight
+
+- Inspect the current repository and all applicable `AGENTS.md` instructions. Preserve existing work and record the current baseline before edits.
+- Record the selected stack/providers and unresolved deployment decisions in `docs/decisions.md`: initial WhatsApp number/device and session owner, open-wa release/license/session backup, Zoho organization/data center and object/field mapping, Bedrock region/model/key provisioning, identity provider/roles, database/hosting/queue, language and location vocabulary, requirement-completeness criteria, consent/retention/deletion policy.
+- These decisions do not block local architecture, schemas, fake adapters, or tests. Keep live integrations disabled until their credentials, access, mapping, and sandbox/device checks exist. Ask for user input only when the next specific action truly depends on an unavailable choice or credential.
+- Confirm and document the approved opt-out and human-response policy before live outbound messaging. Never let an unresolved policy silently enable automation.
+
+**Completion check:** repository constraints and defaults are recorded; unresolved items have an owner/required action; work can proceed safely using fake adapters.
+
 ### Milestone 1 — Application foundation
 
 - Initialize a Python project with `uv`, FastAPI, settings validation, structured logging, and a health/readiness endpoint.
@@ -98,12 +196,13 @@ When credentials are not supplied, finish the integration through its interface 
 - Add development services/configuration for database and required dependencies.
 - Create release metadata from environment/build settings.
 - Create fake CRM and LLM adapters so the full flow can be exercised without external credentials.
+- Define typed settings and safe `.env.example` values for database, open-wa API key/webhook secret, Bedrock region/model/bearer key, Zoho OAuth client/refresh credentials/data center, identity provider, and runtime controls. Inject actual secrets through the deployment secret manager; never commit them.
 
 **Completion check:** clean local setup instructions work from an empty checkout; app starts without production secrets; migrations apply; health/readiness distinguishes process health from dependency health.
 
 ### Milestone 2 — Domain schema and migrations
 
-Implement the canonical schema below and in the architecture proposal, adjusting details only when needed for correctness and documenting changes:
+Implement the canonical schema defined in this guide, adjusting details only when needed for correctness and documenting changes:
 
 - `contacts`, `conversations`, `messages`, `message_attachments`
 - `client_context`, `property_requirements`, `portfolio_assets`, `context_facts`
@@ -203,13 +302,14 @@ Examples below illustrate storage intent; use real UUIDs and timestamps in the a
 
 When an admin sends a reply, insert an outbound `messages` row with `sender_type=admin` and `sender_admin_id`, a `message_send_attempts` row, and an audit event. If open-wa later reports acknowledgement changes, append `message_delivery_events` and update only the current `messages.delivery_status` projection. For an interactive response, store stable option IDs and display labels in `interactive_payload`; when a customer selects an option, store a separate inbound message/event linked to the interactive message ID. Never rewrite the original outbound message to pretend it was the customer's selection.
 
-For transcript reads, use cursor pagination by `(created_at, id)` and authorize access to the contact/conversation. Do not load an unbounded transcript into an admin page or model context. The model receives a bounded, relevant context assembled from recent messages and structured facts; the transcript remains fully stored for authorized audit/export.
+For transcript reads, use cursor pagination by `(created_at, id)` and authorize access to the contact/conversation. Do not load an unbounded transcript into a single API response or model context. The model receives a bounded, relevant context assembled from recent messages and structured facts; the transcript remains fully stored for authorized audit/export.
 
-The coding agent must update `ARCHITECTURE.md` if an implementation choice changes this contract and must explain why. Do not leave schema behavior as an undocumented guess.
+If an implementation choice changes this contract, update the relevant section of this guide and `docs/decisions.md`, and explain why. Do not leave schema behavior as an undocumented guess.
 
 ### Milestone 3 — open-wa integration
 
 - Add a documented, version-pinned open-wa Easy API deployment/configuration, separate from the Python package.
+- Treat open-wa as a self-hosted, unofficial WhatsApp Web integration, not Meta's official WhatsApp Business Platform API. Before production, record business acceptance of account/service disruption risk, the linked number/device owner, pinned release, license tier, and session persistence/recovery procedure.
 - Configure private binding/network access, API key, webhook shared secret, persistent session storage, and event selection.
 - Implement `POST /webhooks/open-wa`: validate shared-secret header, validate envelope, deduplicate, persist to durable inbox, and acknowledge only after persistence.
 - Implement normalized inbound message and acknowledgement/status event models.
@@ -217,6 +317,8 @@ The coding agent must update `ARCHITECTURE.md` if an implementation choice chang
 - Implement a Python open-wa HTTP client with timeouts, safe retries, typed errors, and redacted logs.
 - Add integration health/session status visibility and a documented QR pairing/recovery procedure.
 - Never use the SSE event stream as the only durable production ingestion path unless replay/reconciliation is added; account for webhook retries and durable delivery configuration.
+- Verify whether the pinned open-wa webhook queue is durable or in-memory by default and configure persistence where available. The Python inbox remains the system of record; webhook delivery is at-least-once and must be deduplicated. Do not expose open-wa API, pairing, session-control, or health endpoints publicly.
+- Before enabling interactive options, verify exact installed-version and license support on a test account/device. Keep the feature flag off until verified, and keep plain text intake complete.
 
 **Completion check:** local/staging tests cover valid/invalid secret, duplicate delivery, persistence-before-ack, text send, timeout/error behavior, and reconnect/session status without using a real customer contact.
 
@@ -259,11 +361,12 @@ The coding agent must update `ARCHITECTURE.md` if an implementation choice chang
 ### Milestone 6 — Structured real estate context and Zoho CRM adapter
 
 - Support multiple simultaneous buy and sell requirements and multiple portfolio assets per contact.
-- Track type, locations, budget/expected price, currency, timing, purpose, property size/bedrooms, optional preferences, free-text context, and status/readiness as described in `ARCHITECTURE.md`.
+- Track transaction type, property type, locations, budget/expected price and currency, timing, purpose, size/bedrooms, optional preferences, customer-shared notes, status, and match readiness using the schema in this guide.
 - Store provenance, confidence, source message/admin, and fact history. Preserve original customer wording alongside normalized fields.
 - Add CRM adapter interface, field mapping configuration, fake CRM, and sync status API.
 - Implement Zoho CRM API v8 adapter with OAuth refresh-token management, configured data-center/API domains, least-privilege scopes, sandbox verification, field mapping, rate-limit handling, and idempotent upsert behavior. Keep Zoho payloads inside the adapter.
 - Map contacts, buyer/seller requirements, portfolio records, and relevant context to explicitly configured Zoho modules/fields. Do not assume custom modules or fields exist; provide a mapping/configuration step and report missing CRM metadata clearly.
+- Decide and document whether each buy requirement and sell mandate maps to separate Zoho Leads/Deals/custom related records or another explicit object model. Preserve multiple simultaneous requirements and portfolio assets; do not flatten them into one free-text note when structured fields/related records are available. Store source and timestamp for mapped values, and never let low-confidence extraction overwrite a verified human-entered CRM value.
 - Retry sync safely; define conflicts so low-confidence extraction does not overwrite verified human data.
 
 **Completion check:** buyer, seller, portfolio, and mixed-intent examples map to distinct records; corrections retain history; CRM failures are visible and retryable without duplicate CRM records.
@@ -281,6 +384,17 @@ The coding agent must update `ARCHITECTURE.md` if an implementation choice chang
 **Completion check:** skill files load deterministically; malformed files fail safely; extraction does not lose facts; unknown/low-confidence/sensitive cases hand over; untrusted message content cannot alter system instructions.
 
 #### Skill file format and runtime contract
+
+Initial Markdown skills:
+
+- `buyer_intake.md`: buy intent, budget/currency, property type, locations, timing, purpose, bedrooms/area, and preferences.
+- `seller_intake.md`: property/location/type, size/bedrooms, ownership/availability, expected price/currency, sale timing, and constraints.
+- `portfolio_capture.md`: current properties and customer-shared ownership/portfolio details, separate from desired buy/sell requirements.
+- `general_property_questions.md`: approved general answers and explicit handover boundaries; never invent current inventory, price, or availability.
+- `unknown_question_handover.md`: acknowledge unknowns, avoid guessing, create admin handover, and wait for explicit hand-back.
+- `skill_reviewer.md`: offline-only reviewer prompt for repeated mistakes in de-identified conversations, proposed skill diffs, and regression tests. It cannot answer customers or directly edit/deploy skills.
+
+Every skill uses stable intent, field, and option keys; distinguishes required from optional fields; includes question order, selection options where useful, free-text alternatives, allowed claims, and handover behavior. User-provided text can be evidence for review, never trusted instructions for the reviewer or agent.
 
 Skills are plain Markdown files in `skills/`, loaded by the application from the deployed release. They contain human-authored instructions and declarative metadata only; never execute Python/JavaScript embedded in a skill or allow a skill to grant tools/permissions. Add a parser/validator for frontmatter and fail startup or disable the invalid skill with a clear operator error rather than silently interpreting malformed content.
 
@@ -394,9 +508,49 @@ To establish this evidence, use each `agent_runs.known_fact_ids_json` and `reque
 
 **Completion check:** staging walkthrough passes; all critical failures are observable and recoverable; no unresolved security-critical issues; live credentials/integrations remain explicitly identified as pending if not supplied.
 
+### Operational risks and required mitigations
+
+| Risk | Required mitigation |
+| --- | --- |
+| open-wa session disconnect/loss | Persist session state securely, monitor session health, document QR re-link, and exercise restart/recovery. |
+| Duplicate or lost webhook event | Durable Python inbox, event idempotency, configured open-wa delivery durability, dead-letter monitoring, and reconciliation. |
+| Interactive feature/license unavailable | Verify exact release/license/device behavior and preserve text fallback. |
+| Admin takes over while AI reply is queued | Serialize conversation state and re-check ownership at dispatch; cancel AI outbox item after takeover. |
+| Customer data exposed in skill review | Restrict and audit exports, de-identify by default, exclude private notes, retain only as policy permits, and use synthetic/redacted fixtures. |
+| CRM values conflict with extracted facts | Preserve provenance/source priority, surface conflicts, and never overwrite verified human data with low-confidence extraction. |
+| Skill overfits to one chat | Use minimum recurrence and distinct-conversation thresholds; regression test; human review; normal code review/CI/deployment. |
+| Bedrock or Zoho outage/throttling | Bounded timeouts, provider-aware retries/backoff, visible lag/errors, durable outbox, and safe no-model/handover behavior. |
+
+### Customer context and CRM ownership
+
+Keep messages, provenance, workflow, skill release, and structured requirements authoritative in the application database. Treat Zoho as the sales team's operational CRM, with application-to-CRM writes only for explicitly mapped fields in the MVP. Preserve multiple independent buy/sell requirements and multiple portfolio properties. Record field ownership and source/timestamp; do not implement bidirectional conflict resolution until a separate CRM inbound-event and ownership policy exists. CRM sync is asynchronous and must never block WhatsApp intake, storage, or admin replies.
+
 ## 7. API behavior requirements
 
-Implement API shapes consistent with `ARCHITECTURE.md`, including:
+Implement the following API behavior. Route names are the initial contract and may be extended consistently as implementation requires:
+
+| Method / route | Purpose |
+| --- | --- |
+| `POST /webhooks/open-wa` | Authenticate shared-secret header, validate and deduplicate event, durably enqueue, then acknowledge. No Meta webhook challenge/signature flow applies. |
+| `GET /api/conversations` | Admin queue and conversation filters, including handover status, assignment, and activity. |
+| `GET /api/conversations/{id}` | Authorized paginated transcript, current context, requirements, portfolio, skill/release, CRM sync, and handover state. |
+| `GET /api/contacts/{id}/context` | Structured client context, requirements, portfolio, provenance, and CRM link. |
+| `POST /api/conversations/{id}/messages` | Admin direct WhatsApp text reply, persisted and dispatched by the outbound worker. |
+| `POST /api/conversations/{id}/interactive-messages` | Admin interactive message using supported type, stable option IDs, labels, and a text fallback. |
+| `POST /api/conversations/{id}/handovers` | Open/assign handover and pause automation; normally orchestrator initiated, also available for authorized manual handover. |
+| `POST /api/handovers/{id}/context-notes` | Add private, conversation-scoped admin context. Never sends a customer message. |
+| `POST /api/handovers/{id}/handback` | Explicitly resume automation, optionally with an admin summary. |
+| `PATCH /api/contacts/{id}/context` | Admin correction to general client context with provenance. |
+| `POST /api/contacts/{id}/requirements`, `PATCH /api/requirements/{id}` | Create or correct a buy/sell requirement and match-readiness state. |
+| `POST /api/contacts/{id}/portfolio-assets`, `PATCH /api/portfolio-assets/{id}` | Add or correct an existing portfolio property. |
+| `GET /api/contacts/{id}/crm-status`, `POST /api/operations/crm-sync/{contact_id}/retry` | Inspect or retry asynchronous Zoho synchronization. |
+| `POST /api/operations/transcript-exports` | Create an authorized/audited full or filtered export including admin replies; de-identify by default and exclude private notes. |
+| `POST /api/operations/skill-reviews` | Supervisor starts a scheduled/manual review over an allowed cohort. |
+| `GET /api/skill-improvement-proposals`, `GET /api/skill-improvement-proposals/{id}` | List proposals and inspect sanitized evidence, diff, regression cases, and validation status. |
+| `POST /api/skill-improvement-proposals/{id}/decision` | Supervisor approves/rejects with reason. Approval authorizes human code work; it does not edit or deploy skills. |
+| `POST /api/operations/conversations/{id}/resume` | Audited admin recovery action after checking paused/error state. |
+
+All internal routes require authenticated identity, server-side role checks, request correlation, validation, and idempotency for repeatable side effects. Minimum roles are `admin` (conversation operations/profile correction), `supervisor` (admin plus assignment/export/rollout/proposal decisions), and `read_only` (read only; export separately granted). Keep OIDC/managed identity in production, enable MFA where available, and protect cookie-authenticated mutations against CSRF. Reads of private notes/transcripts and privileged changes must be audited. Never expose open-wa credentials to API clients. API models must distinguish customer, automated-agent, admin-sent, private-note, and unsent-draft records.
 
 - open-wa webhook ingestion.
 - Conversation list/detail with transcript and context.
@@ -446,7 +600,7 @@ The project is complete when:
 At completion, report:
 
 1. What was implemented, grouped by milestone.
-2. Important architecture decisions and any deviations from the two design documents.
+2. Important architecture decisions and any deviations from this guide, with rationale and updates to the relevant guide section/decision record.
 3. Commands/checks run and their results.
 4. How to start the local/staging system.
 5. Which integrations are live versus mocked, including Bedrock bearer-token configuration and Zoho OAuth/sandbox status.
