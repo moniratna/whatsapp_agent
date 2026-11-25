@@ -38,6 +38,13 @@ from app.skills.loader import load_skills, select_skill
 logger = logging.getLogger("whatsapp_assistant.conversation_worker")
 
 
+def _handover_reason_fields(reason: str | None) -> tuple[str, str | None]:
+    value = (reason or "").strip()
+    if value and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
+        return value, None
+    return "model_handover", value[:2000] or None
+
+
 def _requirement_missing_core_fields(requirement: PropertyRequirement) -> list[str]:
     missing: list[str] = []
     if not requirement.purpose:
@@ -719,6 +726,8 @@ class ConversationWorker:
                     event.status,
                 )
                 return
+            if decision.intent in {"buy", "sell", "portfolio", "general", "mixed"}:
+                locked_conversation.active_intent = decision.intent
             active_handover = session.scalar(
                 select(HandoverCase.id).where(
                     HandoverCase.conversation_id == locked_conversation.id,
@@ -810,15 +819,18 @@ class ConversationWorker:
                     .with_for_update()
                 )
                 if case is None:
+                    if locked_contact.consent_status == "opted_out":
+                        handover_reason_code, handover_reason_summary = "opt_out", None
+                    elif fact_conflict:
+                        handover_reason_code, handover_reason_summary = "context_conflict", None
+                    else:
+                        handover_reason_code, handover_reason_summary = _handover_reason_fields(
+                            decision.handover_reason or "low_confidence"
+                        )
                     case = HandoverCase(
                         conversation_id=locked_conversation.id,
-                        reason_code=(
-                            "opt_out"
-                            if locked_contact.consent_status == "opted_out"
-                            else "context_conflict"
-                            if fact_conflict
-                            else (decision.handover_reason or "low_confidence")
-                        ),
+                        reason_code=handover_reason_code,
+                        reason_summary=handover_reason_summary,
                         trigger_message_id=message.id,
                         status="open",
                     )

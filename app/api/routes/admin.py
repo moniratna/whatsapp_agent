@@ -8,7 +8,7 @@ from typing import Annotated, Any, cast
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from sqlalchemy import and_, delete, exists, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -60,7 +60,12 @@ from app.db.models import (
     MessageSendAttempt,
     PortfolioAsset,
     PropertyRequirement,
+    ReviewerEvaluation,
+    ReviewerUpdateRun,
     RuntimeControl,
+    SkillActiveUpdate,
+    SkillCandidateFile,
+    SkillConsolidationBatch,
     SkillImprovementProposal,
     SkillReviewRun,
     TranscriptExport,
@@ -75,6 +80,88 @@ SupervisorPrincipal = Annotated[AdminPrincipal, Depends(require_roles("superviso
 IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=256)]
 
 _ACTIVE_HANDOVER = ("open", "assigned", "admin_owned")
+
+
+@router.get("/operations/skill-updates")
+def skill_update_operations(
+    session: DbSession,
+    principal: ReadPrincipal,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Return sanitized queue counts and recent state for operator triage."""
+
+    def grouped(column: Any) -> dict[str, int]:
+        rows = session.execute(select(column, func.count()).group_by(column)).all()
+        return {str(key): cast(int, count) for key, count in rows}
+
+    batches = list(
+        session.scalars(
+            select(SkillConsolidationBatch)
+            .where(SkillConsolidationBatch.status.in_({"failed", "cleanup_pending"}))
+            .order_by(SkillConsolidationBatch.updated_at.desc())
+            .limit(20)
+        )
+    )
+    reviewer_runs = list(
+        session.scalars(
+            select(ReviewerUpdateRun)
+            .where(
+                ReviewerUpdateRun.status.in_({"failed", "queued", "applying", "cleanup_pending"})
+            )
+            .order_by(ReviewerUpdateRun.updated_at.desc())
+            .limit(20)
+        )
+    )
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "flags": {
+            "skill_updates_enabled": settings.skill_updates_enabled,
+            "extraction_enabled": settings.skill_update_extraction_enabled,
+            "candidate_writes_enabled": settings.skill_update_candidate_writes_enabled,
+            "consolidation_enabled": settings.skill_update_consolidation_enabled,
+            "customer_auto_merge_enabled": settings.skill_update_auto_merge_enabled,
+            "reviewer_updates_enabled": settings.skill_reviewer_updates_enabled,
+        },
+        "metrics": {
+            "candidates_by_type_and_status": grouped(
+                func.concat(
+                    SkillCandidateFile.candidate_type,
+                    ":",
+                    SkillCandidateFile.status,
+                ),
+            ),
+            "batches_by_status": grouped(SkillConsolidationBatch.status),
+            "active_updates_by_status": grouped(SkillActiveUpdate.status),
+            "reviewer_runs_by_status": grouped(ReviewerUpdateRun.status),
+            "reviewer_evaluations_by_decision": grouped(ReviewerEvaluation.decision),
+        },
+        "recent_batch_attention": [
+            {
+                "batch_id": str(batch.id),
+                "source_type": batch.source_conversation_type,
+                "status": batch.status,
+                "attempt_count": batch.attempt_count,
+                "next_attempt_at": batch.next_attempt_at.isoformat()
+                if batch.next_attempt_at
+                else None,
+                "failure": batch.validation_json.get("retry", {}).get("last_error_code")
+                or batch.validation_json.get("cleanup_failure", {}).get("reason_code")
+                or batch.validation_json.get("activation_failure", {}).get("error_code"),
+                "updated_at": batch.updated_at.isoformat(),
+            }
+            for batch in batches
+        ],
+        "recent_reviewer_attention": [
+            {
+                "run_id": str(run.id),
+                "customer_batch_id": str(run.customer_batch_id),
+                "status": run.status,
+                "error_code": run.error_code,
+                "updated_at": run.updated_at.isoformat(),
+            }
+            for run in reviewer_runs
+        ],
+    }
 
 
 def _encode(value: Any) -> dict[str, Any]:
@@ -439,9 +526,7 @@ def reset_conversation_messages(
 ) -> dict[str, Any]:
     """Clear a conversation transcript and its derived memory for test resets."""
     conversation = session.scalar(
-        select(Conversation)
-        .where(Conversation.id == conversation_id)
-        .with_for_update()
+        select(Conversation).where(Conversation.id == conversation_id).with_for_update()
     )
     if conversation is None:
         raise HTTPException(status_code=404, detail="conversation not found")
@@ -451,17 +536,13 @@ def reset_conversation_messages(
 
     messages = list(
         session.scalars(
-            select(Message)
-            .where(Message.conversation_id == conversation_id)
-            .with_for_update()
+            select(Message).where(Message.conversation_id == conversation_id).with_for_update()
         )
     )
     message_ids = [message.id for message in messages]
     runs = list(
         session.scalars(
-            select(AgentRun)
-            .where(AgentRun.conversation_id == conversation_id)
-            .with_for_update()
+            select(AgentRun).where(AgentRun.conversation_id == conversation_id).with_for_update()
         )
     )
     run_ids = [run.id for run in runs]
@@ -494,9 +575,7 @@ def reset_conversation_messages(
         event.lease_expires_at = None
 
     if run_ids:
-        session.execute(
-            delete(AgentRunDraft).where(AgentRunDraft.agent_run_id.in_(run_ids))
-        )
+        session.execute(delete(AgentRunDraft).where(AgentRunDraft.agent_run_id.in_(run_ids)))
     # Automated messages require an agent_run_id. Temporarily turn them into
     # system rows inside this transaction so the run/message cycle can be removed.
     for message in messages:
@@ -566,7 +645,10 @@ def reset_conversation_messages(
         "conversation.messages_reset",
         "conversation",
         conversation_id,
-        after={"deleted_message_count": len(message_ids), "cleared_requirement_count": len(requirement_ids)},
+        after={
+            "deleted_message_count": len(message_ids),
+            "cleared_requirement_count": len(requirement_ids),
+        },
     )
     session.commit()
     return {

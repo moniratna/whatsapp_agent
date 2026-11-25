@@ -1,6 +1,30 @@
+from pathlib import Path
+
+import pytest
 from pydantic import SecretStr
 
 from app.config.settings import Settings
+
+
+def test_skill_update_rollout_flags_are_independently_off_and_ordered(tmp_path: Path) -> None:
+    defaults = Settings(_env_file=None)
+    assert not defaults.skill_updates_enabled
+    assert not defaults.skill_update_extraction_enabled
+    assert not defaults.skill_update_candidate_writes_enabled
+    assert not defaults.skill_update_consolidation_enabled
+    assert not defaults.skill_update_auto_merge_enabled
+    assert not defaults.skill_reviewer_updates_enabled
+
+    storage = tmp_path / "skill-updates"
+    storage.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="EXTRACTION_ENABLED is required"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            skill_updates_enabled=True,
+            skill_update_candidate_writes_enabled=True,
+            skill_update_storage_dir=storage,
+        )
 
 
 def test_safe_shadow_kill_switch_does_not_make_readiness_fail() -> None:
@@ -20,6 +44,7 @@ def test_safe_shadow_kill_switch_does_not_make_readiness_fail() -> None:
 
 def test_fakes_are_not_reported_as_live_staging_integrations() -> None:
     settings = Settings(
+        _env_file=None,
         app_env="staging",
         auth_mode="oidc",
         oidc_issuer_url="https://identity.example.test",

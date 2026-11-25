@@ -4,9 +4,9 @@ import logging
 import re
 import sys
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -31,9 +31,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     if settings.run_workers_in_api and settings.app_env not in {"development", "test"}:
         raise RuntimeError("RUN_WORKERS_IN_API is restricted to local development and test")
 
-    modules = ["app.workers.conversation", "app.workers.outbound"]
-    if settings.zoho_enabled:
-        modules.append("app.workers.crm_sync")
+    modules = [
+        "app.workers.conversation",
+        "app.workers.outbound",
+        "app.workers.crm_sync",
+        "app.workers.exports",
+        "app.workers.skill_reviews",
+        "app.workers.skill_updates",
+        "app.workers.reviewer_updates",
+    ]
     project_directory = Path(__file__).resolve().parent.parent
     try:
         if settings.run_workers_in_api:

@@ -60,6 +60,9 @@ class Contact(TimestampMixin, Base):
     consent_status: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
     consent_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     retention_state: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
+    legal_hold: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
 
 
 class Conversation(TimestampMixin, Base):
@@ -127,7 +130,8 @@ class Message(Base):
             name="ck_messages_sentiment",
         ),
         CheckConstraint(
-            "sentiment_confidence IS NULL OR (sentiment_confidence >= 0 AND sentiment_confidence <= 1)",
+            "sentiment_confidence IS NULL OR (sentiment_confidence >= 0 "
+            "AND sentiment_confidence <= 1)",
             name="ck_messages_sentiment_confidence",
         ),
         Index("ix_messages_conversation_order", "conversation_id", "created_at", "id"),
@@ -178,7 +182,8 @@ class IntegrationEvent(TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("direction IN ('inbound','outbound')", name="ck_integration_direction"),
         CheckConstraint(
-            "status IN ('pending','processing','succeeded','retry_wait','dead_letter','ambiguous','cancelled')",
+            "status IN ('pending','processing','succeeded','retry_wait','dead_letter',"
+            "'ambiguous','cancelled')",
             name="ck_integration_status",
         ),
         Index(
@@ -745,3 +750,312 @@ class SkillImprovementProposal(TimestampMixin, Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     code_change_ref: Mapped[str | None] = mapped_column(String(256))
     deployed_release: Mapped[str | None] = mapped_column(String(128))
+
+
+class SkillUpdateRun(Base):
+    __tablename__ = "skill_update_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued','running','completed','partial','failed')",
+            name="ck_skill_update_run_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_skill_update_run_attempt_count"),
+        CheckConstraint("conversation_count >= 0", name="ck_skill_update_run_conversation_count"),
+        CheckConstraint("candidate_count >= 0", name="ck_skill_update_run_candidate_count"),
+        Index("ix_skill_update_run_queue", "status", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="queued", server_default="queued"
+    )
+    selection_json: Mapped[dict[str, Any]] = mapped_column(json_type, nullable=False)
+    application_release: Mapped[str] = mapped_column(String(128), nullable=False)
+    reviewer_release: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    candidate_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SkillCandidateFile(TimestampMixin, Base):
+    __tablename__ = "skill_candidate_files"
+    __table_args__ = (
+        CheckConstraint(
+            "candidate_type IN ('customer_skill','reviewer_skill')",
+            name="ck_skill_candidate_type",
+        ),
+        CheckConstraint(
+            "source_conversation_type IS NULL OR source_conversation_type IN "
+            "('buyer','seller','portfolio','general','unknown')",
+            name="ck_skill_candidate_source_type",
+        ),
+        CheckConstraint(
+            "target_skill_key IS NULL OR target_skill_key IN "
+            "('buyer','seller','portfolio','general','unknown','skill_reviewer')",
+            name="ck_skill_candidate_target_key",
+        ),
+        CheckConstraint(
+            "(candidate_type = 'customer_skill' AND source_conversation_type IS NOT NULL "
+            "AND conversation_id IS NOT NULL AND (target_skill_key IS NULL OR "
+            "target_skill_key IN ('buyer','seller','portfolio','general','unknown')) OR "
+            "candidate_type = 'reviewer_skill' AND source_conversation_type IS NULL "
+            "AND conversation_id IS NULL AND reviewer_release IS NOT NULL "
+            "AND target_skill_key = 'skill_reviewer')",
+            name="ck_skill_candidate_type_fields",
+        ),
+        CheckConstraint(
+            "status IN ('writing','pending','claimed','merged','rejected',"
+            "'cleanup_pending','cleaned')",
+            name="ck_skill_candidate_status",
+        ),
+        CheckConstraint("sequence > 0", name="ck_skill_candidate_sequence"),
+        UniqueConstraint("relative_path", name="uq_skill_candidate_relative_path"),
+        UniqueConstraint(
+            "source_conversation_type", "sequence", name="uq_skill_candidate_source_sequence"
+        ),
+        Index(
+            "uq_skill_candidate_reviewer_sequence",
+            "sequence",
+            unique=True,
+            postgresql_where=text("candidate_type = 'reviewer_skill'"),
+            sqlite_where=text("candidate_type = 'reviewer_skill'"),
+        ),
+        Index(
+            "uq_skill_candidate_conversation",
+            "conversation_id",
+            unique=True,
+            postgresql_where=text("candidate_type = 'customer_skill'"),
+            sqlite_where=text("candidate_type = 'customer_skill'"),
+        ),
+        Index(
+            "uq_skill_candidate_reviewer_run",
+            "run_id",
+            unique=True,
+            postgresql_where=text("candidate_type = 'reviewer_skill' AND run_id IS NOT NULL"),
+            sqlite_where=text("candidate_type = 'reviewer_skill' AND run_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_skill_candidate_customer_fingerprint",
+            "content_fingerprint",
+            unique=True,
+            postgresql_where=text(
+                "candidate_type = 'customer_skill' AND content_fingerprint IS NOT NULL "
+                "AND status != 'rejected'"
+            ),
+            sqlite_where=text(
+                "candidate_type = 'customer_skill' AND content_fingerprint IS NOT NULL "
+                "AND status != 'rejected'"
+            ),
+        ),
+        Index("ix_skill_candidate_pending", "candidate_type", "source_conversation_type", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    candidate_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    source_conversation_type: Mapped[str | None] = mapped_column(String(16))
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("skill_update_runs.id", ondelete="SET NULL")
+    )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    reviewer_release: Mapped[str | None] = mapped_column(String(64))
+    target_skill_key: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="writing", server_default="writing"
+    )
+    relative_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    content_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    evidence_refs_json: Mapped[list[str]] = mapped_column(
+        json_type, nullable=False, default=list, server_default="[]"
+    )
+    regression_cases_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        json_type, nullable=False, default=list, server_default="[]"
+    )
+    source_skill_version: Mapped[str | None] = mapped_column(String(128))
+    source_snapshot_ids_json: Mapped[list[str]] = mapped_column(
+        json_type, nullable=False, default=list, server_default="[]"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class SkillCandidateSequence(Base):
+    __tablename__ = "skill_candidate_sequences"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('buyer','seller','portfolio','general','unknown','reviewer')",
+            name="ck_skill_candidate_sequence_scope",
+        ),
+        CheckConstraint("last_allocated_sequence >= 0", name="ck_skill_candidate_sequence_value"),
+    )
+
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    last_allocated_sequence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
+
+class SkillConsolidationBatch(Base):
+    __tablename__ = "skill_consolidation_batches"
+    __table_args__ = (
+        CheckConstraint(
+            "source_conversation_type IN ('buyer','seller','portfolio','general','unknown')",
+            name="ck_skill_batch_source_type",
+        ),
+        CheckConstraint(
+            "status IN ('claimed','consolidating','validating','updating_skills',"
+            "'completed','cleanup_pending','cleaned','failed')",
+            name="ck_skill_batch_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_skill_batch_attempt_count"),
+        Index("ix_skill_batch_queue", "status", "next_attempt_at", "created_at"),
+        Index("ix_skill_batch_source_status", "source_conversation_type", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    source_conversation_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="claimed", server_default="claimed"
+    )
+    candidate_ids_json: Mapped[list[str]] = mapped_column(json_type, nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_skill_hashes_json: Mapped[dict[str, str]] = mapped_column(
+        json_type, nullable=False, default=dict, server_default="{}"
+    )
+    target_skill_keys_json: Mapped[list[str]] = mapped_column(
+        json_type, nullable=False, default=list, server_default="[]"
+    )
+    artifact_paths_json: Mapped[list[str]] = mapped_column(
+        json_type, nullable=False, default=list, server_default="[]"
+    )
+    validation_json: Mapped[dict[str, Any]] = mapped_column(
+        json_type, nullable=False, default=dict, server_default="{}"
+    )
+    active_skill_update_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SkillActiveUpdate(TimestampMixin, Base):
+    __tablename__ = "skill_active_updates"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('prepared','applying','applied','rolled_back',"
+            "'rollback_required','failed')",
+            name="ck_skill_active_update_status",
+        ),
+        UniqueConstraint("batch_id", name="uq_skill_active_update_batch"),
+        Index("ix_skill_active_update_status", "status", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("skill_consolidation_batches.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_skill_keys_json: Mapped[list[str]] = mapped_column(json_type, nullable=False)
+    base_skill_hashes_json: Mapped[dict[str, str]] = mapped_column(json_type, nullable=False)
+    proposed_skill_hashes_json: Mapped[dict[str, str]] = mapped_column(json_type, nullable=False)
+    applied_skill_hashes_json: Mapped[dict[str, str]] = mapped_column(
+        json_type, nullable=False, default=dict, server_default="{}"
+    )
+    backup_artifacts_json: Mapped[dict[str, dict[str, Any]]] = mapped_column(
+        json_type, nullable=False, default=dict, server_default="{}"
+    )
+    attempts_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        json_type, nullable=False, default=list, server_default="[]"
+    )
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReviewerEvaluation(Base):
+    __tablename__ = "reviewer_evaluations"
+    __table_args__ = (
+        CheckConstraint("decision IN ('passed','failed')", name="ck_reviewer_evaluation_decision"),
+        UniqueConstraint("candidate_id", name="uq_reviewer_evaluation_candidate"),
+        Index("ix_reviewer_evaluation_decision", "decision", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    candidate_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("skill_candidate_files.id", ondelete="RESTRICT"), nullable=False
+    )
+    suite_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    evaluator_release: Mapped[str] = mapped_column(String(128), nullable=False)
+    active_reviewer_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_reviewer_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_results_json: Mapped[list[dict[str, Any]]] = mapped_column(json_type, nullable=False)
+    aggregate_metrics_json: Mapped[dict[str, Any]] = mapped_column(json_type, nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ReviewerUpdateRun(TimestampMixin, Base):
+    __tablename__ = "reviewer_update_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued','no_change','candidate_pending','evaluating','applying',"
+            "'cleanup_pending','completed','failed')",
+            name="ck_reviewer_update_run_status",
+        ),
+        UniqueConstraint("customer_batch_id", name="uq_reviewer_update_customer_batch"),
+        UniqueConstraint("candidate_id", name="uq_reviewer_update_candidate"),
+        Index("ix_reviewer_update_queue", "status", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    customer_batch_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("skill_consolidation_batches.id", ondelete="RESTRICT"), nullable=False
+    )
+    candidate_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("skill_candidate_files.id", ondelete="RESTRICT")
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    suite_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    active_reviewer_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_reviewer_sha256: Mapped[str | None] = mapped_column(String(64))
+    evaluation_json: Mapped[dict[str, Any]] = mapped_column(
+        json_type, nullable=False, default=dict, server_default="{}"
+    )
+    base_skill_hash: Mapped[str | None] = mapped_column(String(64))
+    backup_relative_path: Mapped[str | None] = mapped_column(String(256))
+    backup_sha256: Mapped[str | None] = mapped_column(String(64))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

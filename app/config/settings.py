@@ -1,5 +1,8 @@
 import json
+import os
+import tempfile
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
@@ -36,6 +39,33 @@ class Settings(BaseSettings):
     export_retention_hours: int = Field(default=24, gt=0, le=720)
     exports_s3_bucket: str = ""
     exports_s3_prefix: str = "private/transcript-exports"
+    # Required before the future skill-update workflow is enabled. Kept unset
+    # by default so artifacts cannot silently land on ephemeral local storage.
+    skill_update_storage_dir: Path | None = None
+    skill_updates_enabled: bool = False
+    skill_update_extraction_enabled: bool = False
+    skill_update_candidate_writes_enabled: bool = False
+    skill_update_consolidation_enabled: bool = False
+    skill_update_auto_merge_enabled: bool = False
+    skill_reviewer_updates_enabled: bool = False
+    skill_update_schedule_minutes: int = Field(default=60, gt=0, le=10_080)
+    skill_update_lookback_days: int = Field(default=90, gt=0, le=365)
+    skill_update_max_conversations_per_run: int = Field(default=500, gt=0, le=10_000)
+    skill_update_batch_size: int = Field(default=50, gt=0, le=50)
+    skill_update_candidate_max_bytes: int = Field(default=32_768, gt=0, le=1_048_576)
+    skill_update_consolidated_max_bytes: int = Field(default=262_144, gt=0, le=4_194_304)
+    skill_update_snapshot_max_bytes: int = Field(default=1_048_576, gt=0, le=10_485_760)
+    skill_update_snapshot_retention_days: int = Field(default=7, gt=0, le=30)
+    skill_update_model_input_max_bytes: int = Field(default=262_144, gt=0, le=2_097_152)
+    skill_update_model_output_max_bytes: int = Field(default=65_536, gt=0, le=262_144)
+    skill_update_merge_model_input_max_bytes: int = Field(default=1_048_576, gt=0, le=8_388_608)
+    skill_update_min_confidence: float = Field(default=0.85, ge=0, le=1)
+    skill_update_active_skill_max_bytes: int = Field(default=131_072, gt=0, le=1_048_576)
+    skill_update_backup_retention_days: int = Field(default=30, gt=0, le=365)
+    skill_update_max_attempts: int = Field(default=5, gt=0, le=5)
+    skill_update_retry_initial_seconds: int = Field(default=60, gt=0, le=21_600)
+    skill_update_retry_max_seconds: int = Field(default=21_600, gt=0, le=21_600)
+    skill_reviewer_eval_min_improved_cases: int = Field(default=1, gt=0, le=100)
 
     aws_region: str = "us-east-1"
     bedrock_model_id: str = ""
@@ -70,6 +100,64 @@ class Settings(BaseSettings):
             raise ValueError("Staging and production require OPENWA_TRANSPORT_MODE=live")
         if self.auth_mode == "oidc" and not (self.oidc_issuer_url and self.oidc_client_id):
             raise ValueError("OIDC_ISSUER_URL and OIDC_CLIENT_ID are required when AUTH_MODE=oidc")
+        storage_dir = self.skill_update_storage_dir
+        if storage_dir is not None:
+            storage_dir = storage_dir.expanduser()
+            if not storage_dir.is_absolute():
+                raise ValueError("SKILL_UPDATE_STORAGE_DIR must be an absolute path")
+            storage_dir = storage_dir.resolve(strict=False)
+            project_root = Path(__file__).resolve().parents[2]
+            temp_roots = {
+                Path(tempfile.gettempdir()).resolve(),
+                Path("/tmp").resolve(),
+                Path("/var/tmp").resolve(),
+                Path("/private/tmp").resolve(),
+            }
+            if storage_dir == project_root or project_root in storage_dir.parents:
+                raise ValueError(
+                    "SKILL_UPDATE_STORAGE_DIR must be outside the application repository"
+                )
+            if self.app_env != "test" and any(
+                storage_dir == root or root in storage_dir.parents for root in temp_roots
+            ):
+                raise ValueError("SKILL_UPDATE_STORAGE_DIR must not use temporary storage")
+            if storage_dir.exists() and not storage_dir.is_dir():
+                raise ValueError("SKILL_UPDATE_STORAGE_DIR must be a directory")
+            self.skill_update_storage_dir = storage_dir
+        if self.skill_updates_enabled or self.skill_reviewer_updates_enabled:
+            if storage_dir is None:
+                raise ValueError(
+                    "SKILL_UPDATE_STORAGE_DIR is required when skill update jobs are enabled"
+                )
+            if not storage_dir.is_dir() or not os.access(storage_dir, os.W_OK | os.X_OK):
+                raise ValueError(
+                    "SKILL_UPDATE_STORAGE_DIR must exist and be writable by the application"
+                )
+        stage_flags = (
+            self.skill_update_extraction_enabled,
+            self.skill_update_candidate_writes_enabled,
+            self.skill_update_consolidation_enabled,
+            self.skill_update_auto_merge_enabled,
+        )
+        if any(stage_flags) and not self.skill_updates_enabled:
+            raise ValueError("SKILL_UPDATES_ENABLED is required for skill update stages")
+        if self.skill_update_candidate_writes_enabled and not self.skill_update_extraction_enabled:
+            raise ValueError("SKILL_UPDATE_EXTRACTION_ENABLED is required before candidate writes")
+        if (
+            self.skill_update_consolidation_enabled
+            and not self.skill_update_candidate_writes_enabled
+        ):
+            raise ValueError(
+                "SKILL_UPDATE_CANDIDATE_WRITES_ENABLED is required before consolidation"
+            )
+        if self.skill_update_auto_merge_enabled and not self.skill_update_consolidation_enabled:
+            raise ValueError(
+                "SKILL_UPDATE_CONSOLIDATION_ENABLED is required before automatic skill merges"
+            )
+        if self.skill_update_retry_initial_seconds > self.skill_update_retry_max_seconds:
+            raise ValueError(
+                "SKILL_UPDATE_RETRY_INITIAL_SECONDS cannot exceed SKILL_UPDATE_RETRY_MAX_SECONDS"
+            )
         return self
 
     def readiness_issues(self) -> list[str]:

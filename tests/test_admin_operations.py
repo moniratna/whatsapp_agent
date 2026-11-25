@@ -74,6 +74,21 @@ def admin_headers(role: str = "admin") -> dict[str, str]:
     return {"X-Dev-User": "alice", "X-Dev-Role": role}
 
 
+def test_skill_update_operations_endpoint_exposes_sanitized_queue_metrics(
+    admin_client: TestClient,
+) -> None:
+    response = admin_client.get("/api/operations/skill-updates", headers=admin_headers("read_only"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["flags"]["skill_updates_enabled"] is False
+    assert body["flags"]["reviewer_updates_enabled"] is False
+    assert body["metrics"]["batches_by_status"] == {}
+    assert body["metrics"]["candidates_by_type_and_status"] == {}
+    assert body["recent_batch_attention"] == []
+    assert body["recent_reviewer_attention"] == []
+
+
 def test_read_only_user_cannot_send_or_take_over(
     admin_client: TestClient, session_factory: sessionmaker[Session]
 ) -> None:

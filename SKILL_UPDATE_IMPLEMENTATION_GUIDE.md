@@ -131,13 +131,15 @@ At most one validated learning candidate from one complete conversation snapshot
 | `candidate_type`                                 | `customer_skill` or `reviewer_skill`.                                     |
 | `source_conversation_type`                       | `buyer`, `seller`, `portfolio`, `general`, or `unknown`; null for reviewer candidates. |
 | `target_skill_key` nullable                      | Final destination: `buyer`, `seller`, `portfolio`, `general`, `unknown`, or `skill_reviewer`. |
-| `status`                                         | `pending`, `claimed`, `merged`, `rejected`, `cleanup_pending`, `cleaned`. |
+| `status`                                         | `writing`, `pending`, `claimed`, `merged`, `rejected`, `cleanup_pending`, `cleaned`. |
 | `relative_path`, `sha256`                        | Artifact location and immutable-content check.                            |
 | `evidence_refs_json`, `regression_cases_json`    | Opaque references and declarative checks.                                 |
 | `source_skill_version`, `source_snapshot_ids_json` | Reproducibility/version lineage.                                        |
 | timestamps                                       | Creation and lifecycle audit.                                             |
 
 Allocate a separate monotonically increasing sequence for each `source_conversation_type` and for reviewer candidates. Enforce one candidate maximum per conversation with a unique idempotency constraint on the source conversation/candidate type (plus reviewer release where needed). A no-candidate outcome is stored in the run result. Do not use raw phone numbers or names in paths, manifests, or evidence identifiers.
+
+The implementation uses a `skill_candidate_sequences` row per source type and for `reviewer`, updated transactionally when allocating the next filename number. The `writing` candidate state records the interval after the metadata/sequence reservation and before the candidate file hash is durably recorded.
 
 ### `skill_consolidation_batches`
 
@@ -194,7 +196,8 @@ The active skill files must continue to satisfy the metadata contract in `app/sk
 
 - Trigger the conversation skill job on a configurable schedule and permit an authenticated/manual enqueue path if operations require one.
 - Select a bounded, stable cohort of eligible conversations. Persist the query window and cursor in the run record so retries do not skip or duplicate work.
-- Exclude records prohibited by consent, retention, deletion, legal hold, or policy. Include only customer-visible turns needed to understand the outcome; omit private admin notes and unrelated context.
+- Include recently active `active_agent` conversations as well as closed conversations. For active conversations, freeze the message cutoff at the run window end and page by the latest customer-message timestamp within that window. Exclude `admin_owned` conversations.
+- Exclude records prohibited by retention, deletion, legal hold, or policy. Consent status does not gate skill learning. Include only customer-visible turns needed to understand the outcome; omit private admin notes and unrelated context.
 - Fetch full selected conversation histories in timestamp/sequence order. Preserve message IDs as opaque evidence references.
 - De-identify direct identifiers before any model input, persist a snapshot hash, and apply retention/access controls to raw snapshots.
 - Pin each run to the deployed application release, active skill hashes, reviewer hash, prompt/schema versions, and model configuration identifier (never credentials).
@@ -388,7 +391,7 @@ Each milestone is a small, reviewable code change. A coding agent should read th
 
 ## 11. Suggested rollout sequence
 
-1. **Contract and policy:** decide eligible conversations, consent/deletion handling, data retention, per-source-type 50-file thresholds, configurable file-size limits, quality thresholds, and persistent local storage/backup behavior.
+1. **Contract and policy:** decide eligible conversations, retention/deletion handling, data retention, per-source-type 50-file thresholds, configurable file-size limits, quality thresholds, and persistent local storage/backup behavior. Messaging consent does not gate skill learning; outbound consent and opt-out rules remain separate.
 2. **State and artifacts:** add run/candidate/batch/evaluation records, per-source-type queues, manifest hashing, transactional per-type ID allocation, leases, and explicit runtime skill allowlisting.
 3. **Read-only shadow extraction:** select/de-identify conversations and log proposed structured findings without writing candidate files or changing skills.
 4. **Candidate generation:** write inactive candidate artifacts; validate and deduplicate; observe quality and privacy metrics.
@@ -428,3 +431,32 @@ The following decisions are confirmed and should be treated as requirements by i
 - The alternative `master_skill.md` consolidation workflow is not needed. The deleted `docs/skill-consolidation-workflow.md` must not be recreated as part of this implementation.
 
 The coding agent can resolve remaining operational details in Milestone 0 (conversation eligibility and retention, persistent-volume and active-file backup behavior, retry ceilings, reviewer evaluation thresholds, and whether existing aggregate-only skill review endpoints remain during transition) without reopening the confirmed decisions above.
+
+## 14. Milestone 0 implementation contracts (resolved)
+
+These operational choices complete Milestone 0. They are design contracts for later milestones; they do not enable workers, alter runtime skill loading, or change the existing review APIs.
+
+### Conversation eligibility and privacy
+
+- An eligible conversation is closed or currently `active_agent`, has at least one customer message, and has a complete ordered message snapshot to a fixed cutoff. Active snapshots stop at the run window end (or earlier closure); closed snapshots stop at `closed_at`. Admin-owned conversations are ineligible. A missing or invalid `active_intent` maps to source type `unknown` as already specified; it does not make an otherwise eligible conversation ineligible.
+- Consent status does not gate skill learning: contacts with unknown, opted-in, or opted-out status may be processed. Retention must be active and legal hold must be false at selection and again immediately before snapshot/candidate persistence. Pending deletion, anonymized, and legal-hold contacts are excluded. If retention or legal-hold state changes during processing, discard the snapshot and do not create a candidate. Outbound messaging consent and opt-out enforcement remain separate controls.
+- Process conversations with a closed timestamp or latest customer-message timestamp within the preceding 90 days. This bounds each cohort and avoids indefinite reuse of old conversational data. The retention/deletion system remains authoritative: deletion or anonymization requests remove related snapshots/candidates/evidence where legally and technically applicable; derived artifacts do not extend the underlying data's retention period. Keep only opaque evidence references in candidate artifacts, never transcript excerpts or direct identifiers.
+- De-identified shadow snapshots are stored under the private `work/` directory for at most 7 days, configurable up to 30 days, and are removed sooner when their source data is deleted or anonymized. Keep snapshot metadata (opaque reference, hashes, source conversation ID, and expiry) in the run record; do not put raw database IDs or personal data in artifact filenames or snapshot bodies.
+- Snapshot customer-visible inbound/outbound messages, including admin replies, ordered by `(created_at, id)`. Exclude private admin notes, system-only events, and non-text payload contents unless a later version defines a reviewed, de-identified representation. A conversation with no valid reusable learning records a no-candidate outcome.
+
+### Persistent storage, backup, and size limits
+
+- `SKILL_UPDATE_STORAGE_DIR` must be explicitly configured to a persistent local volume outside the repository and outside temporary directories. If absent, non-persistent, inside the repository, or inaccessible, candidate creation and active updates fail closed. Restrict directory and file permissions to the service account; candidate storage must not be web-served.
+- Candidate and work artifacts are not backed up as deployable skills. Pending candidates and in-flight manifests must survive process restarts and volume snapshots. Temporary snapshots/consolidation artifacts are removed after a terminal outcome; failed work is retained for diagnosis only for the applicable source-data retention window.
+- Administrators remain responsible for carrying locally updated active skill files across deployments/restarts. Before an active-file update, preserve the exact pre-update bytes and hashes in a restricted backup area on the same persistent volume. Apply multi-file updates atomically as a recoverable transaction; retain backups for 30 days after successful verification, and retain them longer while an update is unresolved. Rollback restores the exact prior bytes. No Git commit or push is performed.
+- Initial configurable byte limits for production testing: 32 KiB per customer candidate, 256 KiB per consolidated artifact part, and 128 KiB per active skill file. Enforce limits on UTF-8 encoded bytes, split consolidated content only at complete learning/rule boundaries, and reject an individual learning that cannot fit. These are starting caps to be measured and adjusted before activation, not assumptions about model token limits.
+
+### Retries and reviewer evaluation
+
+- Retry transient extraction, validation infrastructure, and filesystem/database coordination failures at most five attempts total, with exponential backoff starting at one minute and capped at six hours. Validation/policy rejection is terminal for that artifact and is not automatically retried. After the ceiling, park the run/batch for operator review; never discard source candidates because of retry exhaustion.
+- Reviewer improvement candidates are evaluated individually against a versioned, fixed corpus. A candidate passes only if every required safety/policy case passes, it introduces no regression against the active reviewer, and it improves at least one pre-designated target case. Corpus version, active/candidate hashes, per-case results, and the decision are durable before merge. Missing corpus, evaluator failure, or an indeterminate result is a failure and leaves the active reviewer unchanged. Final corpus size and case coverage are release inputs; expansion of that corpus does not change this pass rule.
+- Keep the existing aggregate-only `skill_review_runs` and proposal APIs operational and behavior-compatible during transition. They remain a separate human-review workflow and are not inputs to or substitutes for candidate extraction, batching, merge, or reviewer self-update. Deprecation requires a later explicit migration plan.
+
+### Milestone 0 boundary
+
+The above choices settle Milestone 0's open policies. No schema, settings, worker, loader, API, migration, or active skill behavior is changed by this milestone. Subsequent work must implement these contracts behind disabled-by-default activation flags and may not relax the confirmed policies in section 13.

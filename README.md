@@ -22,9 +22,10 @@ uv run python -m app.workers.outbound
 uv run python -m app.workers.crm_sync
 uv run python -m app.workers.exports
 uv run python -m app.workers.skill_reviews
+uv run python -m app.workers.skill_updates
 ```
 
-For a single-process local setup, set `RUN_WORKERS_IN_API=true` in `.env` and start only `uv run uvicorn app.main:app --reload`. FastAPI will start the conversation and outbound workers, plus CRM sync when `ZOHO_ENABLED=true`, and stop them on shutdown. This option is restricted to development/test; use separately supervised worker processes outside local development.
+For a single-process local setup, set `RUN_WORKERS_IN_API=true` in `.env` and start only `uv run uvicorn app.main:app --reload`. FastAPI starts the conversation, outbound, CRM sync, exports, skill review, customer skill update, and reviewer update workers, then stops them on shutdown. Workers with disabled integrations or feature flags remain idle. This option is restricted to development/test; use separately supervised worker processes outside local development.
 
 With the example settings, the conversation worker uses a deterministic fake LLM, the outbound worker uses a local transport fake (synthetic provider IDs only), and the CRM worker uses an in-memory fake with synthetic object mappings. No external messages or CRM records are created. These fakes are allowed only in `development` and `test`; staging and production require configured integrations.
 
