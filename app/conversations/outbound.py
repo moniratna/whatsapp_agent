@@ -24,6 +24,7 @@ def enqueue_outbound_message(
     agent_run_id: uuid.UUID | None = None,
     skill_key: str | None = None,
     application_release: str | None = None,
+    interactive_payload: dict[str, Any] | None = None,
 ) -> tuple[Message, bool]:
     """Persist a message and its outbox row in the caller's transaction."""
     if sender_type not in {"admin", "automated_agent"}:
@@ -43,7 +44,7 @@ def enqueue_outbound_message(
     event_stmt: Any = insert_fn(IntegrationEvent).values(
         integration="openwa",
         direction="outbound",
-        event_type="whatsapp.send_text",
+        event_type=("whatsapp.send_interactive" if interactive_payload else "whatsapp.send_text"),
         external_event_id=idempotency_key,
         aggregate_type="conversation",
         aggregate_id=conversation_id,
@@ -69,8 +70,9 @@ def enqueue_outbound_message(
         sender_type=sender_type,
         sender_admin_id=sender_admin_id,
         agent_run_id=agent_run_id,
-        message_type="text",
+        message_type="interactive_list" if interactive_payload else "text",
         body_text=body_text,
+        interactive_payload=interactive_payload,
         delivery_status="queued",
         skill_key=skill_key,
         application_release=application_release,

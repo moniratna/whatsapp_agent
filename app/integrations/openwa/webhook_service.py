@@ -177,7 +177,11 @@ def accept_openwa_event(session: Session, envelope: OpenWaEnvelope) -> bool:
         "direction": "inbound",
         "event_type": envelope.event,
         "external_event_id": event_key,
-        "aggregate_type": "conversation" if envelope.event == "message.received" else None,
+        "aggregate_type": (
+            "conversation"
+            if envelope.event in {"message.received", "interactive.response"}
+            else None
+        ),
         "payload_json": payload,
         "status": event_status,
         "last_error_code": error_code,
@@ -212,6 +216,54 @@ def accept_openwa_event(session: Session, envelope: OpenWaEnvelope) -> bool:
         session.commit()
         return True
 
+    interactive_payload = normalized.interactive_payload
+    if interactive_payload is not None:
+        original_message_id = interactive_payload.get("originalMessageId")
+        original_message = None
+        if isinstance(original_message_id, str):
+            original_message = session.scalar(
+                select(Message).where(
+                    Message.provider_account_id == normalized.provider_account_id,
+                    Message.provider_message_id == original_message_id,
+                    Message.direction == "outbound",
+                    Message.message_type == "interactive_list",
+                )
+            )
+        if original_message is None:
+            event.status = "dead_letter"
+            event.last_error_code = "interactive_message_reference_missing"
+            session.commit()
+            logger.warning(
+                "openwa_interactive_response_unmatched event_id=%s session_id=%s",
+                event.id,
+                envelope.session_id,
+            )
+            return True
+        content = original_message.interactive_payload or {}
+        selected_id = interactive_payload.get("id")
+        rows = [
+            row
+            for section in content.get("sections", [])
+            if isinstance(section, dict)
+            for row in section.get("rows", [])
+            if isinstance(row, dict)
+        ]
+        selected = next(
+            (row for row in rows if row.get("id") == selected_id),
+            None,
+        )
+        if selected is None:
+            event.status = "dead_letter"
+            event.last_error_code = "interactive_option_unknown"
+            session.commit()
+            logger.warning(
+                "openwa_interactive_option_unknown event_id=%s session_id=%s",
+                event.id,
+                envelope.session_id,
+            )
+            return True
+        normalized.body_text = str(selected.get("title", selected_id))
+
     event.aggregate_type = "message"
     prior_message = session.scalar(
         select(Message).where(
@@ -230,9 +282,7 @@ def accept_openwa_event(session: Session, envelope: OpenWaEnvelope) -> bool:
         return True
 
     contact = _upsert_contact(session, normalized.provider_account_id, normalized.sender_phone_e164)
-    conversation = _find_or_create_conversation(
-        session, contact, str(envelope.payload["message"]["from"])
-    )
+    conversation = _find_or_create_conversation(session, contact, normalized.sender_chat_id)
     timestamp = timestamp_from_milliseconds(normalized.provider_timestamp_ms)
     message = Message(
         conversation_id=conversation.id,
@@ -242,6 +292,7 @@ def accept_openwa_event(session: Session, envelope: OpenWaEnvelope) -> bool:
         sender_type="customer",
         message_type=normalized.message_type,
         body_text=normalized.body_text,
+        interactive_payload=normalized.interactive_payload,
         provider_timestamp=timestamp,
     )
     session.add(message)

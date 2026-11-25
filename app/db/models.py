@@ -122,6 +122,14 @@ class Message(Base):
             "sender_type != 'automated_agent' OR agent_run_id IS NOT NULL",
             name="ck_messages_automated_agent_run_required",
         ),
+        CheckConstraint(
+            "sentiment IS NULL OR sentiment IN ('positive','neutral','negative','frustrated')",
+            name="ck_messages_sentiment",
+        ),
+        CheckConstraint(
+            "sentiment_confidence IS NULL OR (sentiment_confidence >= 0 AND sentiment_confidence <= 1)",
+            name="ck_messages_sentiment_confidence",
+        ),
         Index("ix_messages_conversation_order", "conversation_id", "created_at", "id"),
         Index(
             "uq_messages_provider_id",
@@ -144,10 +152,19 @@ class Message(Base):
     sender_admin_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("admin_users.id"))
     message_type: Mapped[str] = mapped_column(String(32), nullable=False, default="text")
     body_text: Mapped[str | None] = mapped_column(Text)
+    sentiment: Mapped[str | None] = mapped_column(String(16))
+    sentiment_confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 3))
     interactive_payload: Mapped[dict[str, Any] | None] = mapped_column(json_type)
-    reply_to_message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
+    reply_to_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL")
+    )
     agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("agent_runs.id", use_alter=True, name="fk_messages_agent_run_id_agent_runs")
+        ForeignKey(
+            "agent_runs.id",
+            ondelete="CASCADE",
+            use_alter=True,
+            name="fk_messages_agent_run_id_agent_runs",
+        )
     )
     provider_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     delivery_status: Mapped[str | None] = mapped_column(String(24))
@@ -161,7 +178,7 @@ class IntegrationEvent(TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("direction IN ('inbound','outbound')", name="ck_integration_direction"),
         CheckConstraint(
-            "status IN ('pending','processing','succeeded','retry_wait','dead_letter','ambiguous')",
+            "status IN ('pending','processing','succeeded','retry_wait','dead_letter','ambiguous','cancelled')",
             name="ck_integration_status",
         ),
         Index(
@@ -224,7 +241,9 @@ class HandoverCase(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="open")
     reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
     reason_summary: Mapped[str | None] = mapped_column(Text)
-    trigger_message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
+    trigger_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL")
+    )
     assigned_admin_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("admin_users.id"))
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -257,7 +276,9 @@ class MessageDeliveryEvent(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), nullable=False)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
     provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False, default="default")
     provider_event_id: Mapped[str] = mapped_column(String(256), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
@@ -280,7 +301,9 @@ class MessageSendAttempt(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), nullable=False)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="started")
     request_id: Mapped[str | None] = mapped_column(String(128))
@@ -451,7 +474,9 @@ class ContextFact(Base):
     value_json: Mapped[Any] = mapped_column(json_type, nullable=False)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 3))
     source_type: Mapped[str] = mapped_column(String(24), nullable=False)
-    source_message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
+    source_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE")
+    )
     created_by_admin_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("admin_users.id"))
     valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -465,7 +490,9 @@ class MessageAttachment(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), nullable=False)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
     provider_media_id: Mapped[str | None] = mapped_column(String(256))
     storage_key: Mapped[str | None] = mapped_column(String(512))
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -491,8 +518,12 @@ class AgentRun(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversations.id"), nullable=False
     )
-    trigger_message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), nullable=False)
-    response_message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
+    trigger_message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
+    response_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL")
+    )
     skill_key: Mapped[str | None] = mapped_column(String(128))
     application_release: Mapped[str] = mapped_column(String(128), nullable=False)
     model_provider: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -525,7 +556,7 @@ class AgentRunDraft(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     agent_run_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("agent_runs.id"), unique=True, nullable=False
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), unique=True, nullable=False
     )
     draft_text: Mapped[str] = mapped_column(Text, nullable=False)
     draft_payload_json: Mapped[dict[str, Any] | None] = mapped_column(json_type)

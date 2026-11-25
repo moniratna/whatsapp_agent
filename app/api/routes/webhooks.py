@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import Settings, get_settings
+from app.integrations.openwa.client import OpenWaClient, OpenWaError
 from app.integrations.openwa.schemas import OpenWaEnvelope
 from app.integrations.openwa.webhook_service import accept_openwa_event
 
@@ -22,6 +23,7 @@ async def receive_openwa_webhook(
     webhook_secret: Annotated[str | None, Header(alias="X-Webhook-Secret")] = None,
     openwa_signature: Annotated[str | None, Header(alias="X-OpenWA-Signature")] = None,
 ) -> dict[str, str | bool]:
+    print(request.body)
     expected_secret = settings.openwa_webhook_secret.get_secret_value()
     if not settings.openwa_enabled or not expected_secret:
         raise HTTPException(status_code=503, detail="open-wa webhook is not configured")
@@ -42,9 +44,10 @@ async def receive_openwa_webhook(
     shared_secret_valid = bool(webhook_secret) and hmac.compare_digest(
         webhook_secret or "", expected_secret
     )
-    expected_signature = "sha256=" + hmac.new(
-        expected_secret.encode("utf-8"), bytes(raw_body), hashlib.sha256
-    ).hexdigest()
+    expected_signature = (
+        "sha256="
+        + hmac.new(expected_secret.encode("utf-8"), bytes(raw_body), hashlib.sha256).hexdigest()
+    )
     signature_valid = bool(openwa_signature) and hmac.compare_digest(
         openwa_signature or "", expected_signature
     )
@@ -55,6 +58,32 @@ async def receive_openwa_webhook(
         envelope = OpenWaEnvelope.model_validate_json(raw_body)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail="invalid open-wa event envelope") from exc
+
+    if envelope.event == "message.received":
+        raw_message = envelope.payload.get("message")
+        if isinstance(raw_message, dict):
+            sender = raw_message.get("from")
+            sender_phone = raw_message.get("senderPhone")
+            if isinstance(sender, str) and sender.endswith("@lid") and not sender_phone:
+                client = OpenWaClient(settings)
+                try:
+                    logger.info("openwa_lid_resolution_started session_id=%s", envelope.session_id)
+                    sender_phone = await client.resolve_contact_phone(envelope.session_id, sender)
+                except OpenWaError as exc:
+                    logger.error(
+                        "openwa_lid_resolution_failed session_id=%s code=%s retryable=%s",
+                        envelope.session_id,
+                        exc.code,
+                        exc.retryable,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="OpenWA could not resolve the sender privacy ID",
+                    ) from exc
+                finally:
+                    await client.close()
+                raw_message["senderPhone"] = sender_phone
+                logger.info("openwa_lid_resolution_succeeded session_id=%s", envelope.session_id)
 
     factory: sessionmaker[Session] = request.app.state.session_factory
     with factory() as session:

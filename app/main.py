@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from app.api.routes.admin import router as admin_router
+from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.webhooks import router as webhook_router
 from app.config.settings import get_settings
 from app.db.connection import database_is_ready, make_engine, make_session_factory
@@ -88,6 +89,7 @@ app.state.engine = engine
 app.state.session_factory = make_session_factory(engine)
 app.include_router(webhook_router)
 app.include_router(admin_router)
+app.include_router(dashboard_router)
 
 
 @app.get("/health/live", tags=["health"])

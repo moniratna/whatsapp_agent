@@ -62,3 +62,5 @@ class NormalizedInboundMessage(BaseModel):
     message_type: str
     provider_timestamp_ms: int | None
     attachment: dict[str, Any] | None = None
+    interactive_payload: dict[str, Any] | None = None
+    sender_chat_id: str

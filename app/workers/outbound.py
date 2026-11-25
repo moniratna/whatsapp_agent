@@ -146,7 +146,7 @@ class OutboundWorker:
             return None
         return session.get(Message, message_id)
 
-    def _prepare_send(self, event_id: uuid.UUID) -> tuple[str, str, int] | None:
+    def _prepare_send(self, event_id: uuid.UUID) -> tuple[str, str, str, int] | None:
         now = datetime.now(UTC)
         with self.session_factory.begin() as session:
             event = session.scalar(
@@ -219,7 +219,7 @@ class OutboundWorker:
                 event.attempt_count,
                 "live" if isinstance(self.openwa_client, OpenWaClient) else "fake",
             )
-            return str(message.id), chat_id, event.attempt_count
+            return str(message.id), chat_id, conversation.provider_account_id, event.attempt_count
 
     @staticmethod
     def _dispatch_block_reason(
@@ -284,13 +284,66 @@ class OutboundWorker:
         prepared = self._prepare_send(event_id)
         if prepared is None:
             return True
-        message_id, chat_id, attempt_number = prepared
+        message_id, chat_id, session_id, attempt_number = prepared
+        message_body = ""
+        message_type = "text"
+        interactive_payload = None
         try:
-            provider_message_id = await self.openwa_client.send_text(
-                chat_id,
-                self._load_body(uuid.UUID(message_id)),
+            message_body, message_type, interactive_payload = self._load_content(
+                uuid.UUID(message_id)
             )
+            if message_type == "interactive_list":
+                if not interactive_payload:
+                    raise OpenWaError("outbound_interactive_payload_missing")
+                provider_message_id = await self.openwa_client.send_interactive(
+                    chat_id, interactive_payload
+                )
+            elif isinstance(self.openwa_client, OpenWaClient):
+                provider_message_id = await self.openwa_client.send_text_in_session(
+                    session_id,
+                    chat_id,
+                    message_body,
+                    idempotency_key=message_id,
+                )
+            else:
+                provider_message_id = await self.openwa_client.send_text(chat_id, message_body)
         except OpenWaError as exc:
+            if (
+                message_type == "interactive_list"
+                and exc.outcome == "rejected"
+                and not exc.retryable
+            ):
+                logger.warning(
+                    "outbound_interactive_fallback event_id=%s message_id=%s code=%s",
+                    event_id,
+                    message_id,
+                    exc.code,
+                )
+                try:
+                    if isinstance(self.openwa_client, OpenWaClient):
+                        provider_message_id = await self.openwa_client.send_text_in_session(
+                            session_id,
+                            chat_id,
+                            message_body,
+                            idempotency_key=message_id,
+                        )
+                    else:
+                        provider_message_id = await self.openwa_client.send_text(
+                            chat_id, message_body
+                        )
+                except OpenWaError as fallback_error:
+                    exc = fallback_error
+                else:
+                    self._record_send_success(
+                        event_id, uuid.UUID(message_id), attempt_number, provider_message_id
+                    )
+                    logger.info(
+                        "outbound_text_fallback_accepted event_id=%s message_id=%s attempt=%s",
+                        event_id,
+                        message_id,
+                        attempt_number,
+                    )
+                    return True
             self._record_send_error(event_id, uuid.UUID(message_id), attempt_number, exc)
             logger.error(
                 "outbound_provider_error event_id=%s message_id=%s attempt=%s code=%s "
@@ -314,12 +367,14 @@ class OutboundWorker:
         )
         return True
 
-    def _load_body(self, message_id: uuid.UUID) -> str:
+    def _load_content(
+        self, message_id: uuid.UUID
+    ) -> tuple[str, str, dict[str, Any] | None]:
         with self.session_factory() as session:
             message = session.get(Message, message_id)
             if message is None or not message.body_text:
                 raise OpenWaError("outbound_body_missing")
-            return message.body_text
+            return message.body_text, message.message_type, message.interactive_payload
 
     def _record_send_success(
         self,

@@ -29,6 +29,11 @@ def stable_event_key(envelope: OpenWaEnvelope) -> str:
     if envelope.idempotency_key:
         source = f"{envelope.session_id}:{envelope.idempotency_key}"
         return hashlib.sha256(source.encode()).hexdigest()
+    if envelope.event == "interactive.response":
+        response = envelope.payload.get("response", {})
+        response_id = response.get("messageId") if isinstance(response, dict) else None
+        source = f"{envelope.session_id}:{envelope.event}:{response_id or envelope.timestamp}"
+        return hashlib.sha256(source.encode()).hexdigest()
     message = envelope.payload.get("message", {})
     if envelope.event == "ack.changed":
         ctx = envelope.payload.get("ctx")
@@ -47,6 +52,41 @@ def provider_account_id(session_id: str) -> str:
 
 
 def normalize_inbound(envelope: OpenWaEnvelope) -> NormalizedInboundMessage:
+    if envelope.event == "interactive.response":
+        response: Any = envelope.payload.get("response")
+        if not isinstance(response, dict):
+            raise ValueError("interactive.response is missing payload.response")
+        chat_id = response.get("chatId")
+        message_id = response.get("messageId")
+        option_id = response.get("id")
+        option_label = response.get("label")
+        if not isinstance(chat_id, str) or not isinstance(message_id, str):
+            raise ValueError("interactive response is missing chatId or messageId")
+        phone_match = _PHONE_ID.fullmatch(chat_id)
+        if phone_match is None:
+            raise UnsupportedOpenWaEvent("interactive_response_not_direct_chat")
+        phone = phone_match.group("number")
+        body = option_label if isinstance(option_label, str) and option_label else option_id
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError("interactive response is missing selected option")
+        raw_timestamp = response.get("timestamp")
+        timestamp_ms = (
+            timestamp_to_milliseconds(raw_timestamp) if raw_timestamp is not None else None
+        )
+        return NormalizedInboundMessage(
+            provider_account_id=provider_account_id(envelope.session_id),
+            provider_message_id=message_id,
+            sender_phone_e164=phone if phone.startswith("+") else f"+{phone}",
+            sender_chat_id=chat_id,
+            body_text=body,
+            message_type="interactive_reply",
+            provider_timestamp_ms=timestamp_ms,
+            interactive_payload={
+                key: response[key]
+                for key in ("id", "label", "type", "originalMessageId")
+                if response.get(key) is not None
+            },
+        )
     if envelope.event != "message.received":
         raise UnsupportedOpenWaEvent(envelope.event)
     raw_message: Any = envelope.payload.get("message")
@@ -91,10 +131,12 @@ def normalize_inbound(envelope: OpenWaEnvelope) -> NormalizedInboundMessage:
         provider_account_id=provider_account_id(envelope.session_id),
         provider_message_id=message.id,
         sender_phone_e164=phone,
+        sender_chat_id=message.sender,
         body_text=message.body or message.caption,
         message_type="text" if not message.message_type else message.message_type.lower(),
         provider_timestamp_ms=timestamp_ms,
         attachment=attachment,
+        interactive_payload=None,
     )
 
 
@@ -124,7 +166,7 @@ def timestamp_from_milliseconds(timestamp_ms: int | None) -> datetime | None:
 
 def minimal_event_payload(envelope: OpenWaEnvelope) -> dict[str, Any]:
     """Retain only fields needed for durable processing and safe reconciliation."""
-    if envelope.event == "message.received":
+    if envelope.event in {"message.received", "interactive.response"}:
         normalized = normalize_inbound(envelope)
         return {
             "provider_account_id": normalized.provider_account_id,

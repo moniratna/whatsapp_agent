@@ -8,7 +8,7 @@ from typing import Annotated, Any, cast
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, delete, exists, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -43,6 +43,8 @@ from app.conversations.outbound import (
 from app.db.models import (
     AdminContextNote,
     AdminUser,
+    AgentRun,
+    AgentRunDraft,
     AiRolloutAllowlist,
     AuditEvent,
     ClientContext,
@@ -53,6 +55,9 @@ from app.db.models import (
     HandoverCase,
     IntegrationEvent,
     Message,
+    MessageAttachment,
+    MessageDeliveryEvent,
+    MessageSendAttempt,
     PortfolioAsset,
     PropertyRequirement,
     RuntimeControl,
@@ -184,6 +189,8 @@ def _message_view(message: Message) -> dict[str, Any]:
             "sender_admin_id": message.sender_admin_id,
             "message_type": message.message_type,
             "body_text": message.body_text,
+            "sentiment": message.sentiment,
+            "sentiment_confidence": message.sentiment_confidence,
             "interactive_payload": message.interactive_payload,
             "reply_to_message_id": message.reply_to_message_id,
             "provider_timestamp": message.provider_timestamp,
@@ -421,6 +428,154 @@ def get_conversation(
             "has_more": has_more,
         }
     )
+
+
+@router.delete("/conversations/{conversation_id}/messages")
+def reset_conversation_messages(
+    conversation_id: uuid.UUID,
+    session: DbSession,
+    principal: WritePrincipal,
+    request: Request,
+) -> dict[str, Any]:
+    """Clear a conversation transcript and its derived memory for test resets."""
+    conversation = session.scalar(
+        select(Conversation)
+        .where(Conversation.id == conversation_id)
+        .with_for_update()
+    )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    contact = session.get(Contact, conversation.contact_id)
+    if contact is None:
+        raise HTTPException(status_code=404, detail="contact not found")
+
+    messages = list(
+        session.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .with_for_update()
+        )
+    )
+    message_ids = [message.id for message in messages]
+    runs = list(
+        session.scalars(
+            select(AgentRun)
+            .where(AgentRun.conversation_id == conversation_id)
+            .with_for_update()
+        )
+    )
+    run_ids = [run.id for run in runs]
+    requirements = list(
+        session.scalars(
+            select(PropertyRequirement).where(
+                PropertyRequirement.conversation_id == conversation_id
+            )
+        )
+    )
+    requirement_ids = [item.id for item in requirements]
+
+    # Stop queued retries/sends before removing their message payloads.
+    pending_events = list(
+        session.scalars(
+            select(IntegrationEvent)
+            .where(
+                IntegrationEvent.aggregate_type == "conversation",
+                IntegrationEvent.aggregate_id == conversation_id,
+                IntegrationEvent.status.in_(("pending", "processing", "retry_wait")),
+            )
+            .with_for_update()
+        )
+    )
+    for event in pending_events:
+        event.status = "dead_letter"
+        event.last_error_code = "conversation_reset"
+        event.processed_at = datetime.now(UTC)
+        event.lease_owner = None
+        event.lease_expires_at = None
+
+    if run_ids:
+        session.execute(
+            delete(AgentRunDraft).where(AgentRunDraft.agent_run_id.in_(run_ids))
+        )
+    # Automated messages require an agent_run_id. Temporarily turn them into
+    # system rows inside this transaction so the run/message cycle can be removed.
+    for message in messages:
+        if message.sender_type == "automated_agent":
+            message.sender_type = "system"
+            message.agent_run_id = None
+        message.reply_to_message_id = None
+
+    if run_ids:
+        session.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
+    if message_ids:
+        session.execute(
+            delete(MessageAttachment).where(MessageAttachment.message_id.in_(message_ids))
+        )
+        session.execute(
+            delete(MessageDeliveryEvent).where(MessageDeliveryEvent.message_id.in_(message_ids))
+        )
+        session.execute(
+            delete(MessageSendAttempt).where(MessageSendAttempt.message_id.in_(message_ids))
+        )
+        session.execute(
+            delete(ContextFact).where(
+                ContextFact.contact_id == contact.id,
+                ContextFact.source_message_id.in_(message_ids),
+            )
+        )
+        for case in session.scalars(
+            select(HandoverCase).where(HandoverCase.conversation_id == conversation_id)
+        ):
+            case.trigger_message_id = None
+            if case.status in _ACTIVE_HANDOVER:
+                case.status = "handed_back"
+                case.handback_at = datetime.now(UTC)
+        session.execute(delete(Message).where(Message.id.in_(message_ids)))
+
+    if requirement_ids:
+        session.execute(
+            delete(ContextFact).where(
+                ContextFact.contact_id == contact.id,
+                ContextFact.entity_id.in_(requirement_ids),
+            )
+        )
+    for requirement in requirements:
+        requirement.status = "superseded"
+        requirement.match_readiness = "incomplete"
+    session.execute(
+        delete(AdminContextNote).where(AdminContextNote.conversation_id == conversation_id)
+    )
+    client_context = session.scalar(
+        select(ClientContext).where(ClientContext.contact_id == contact.id).with_for_update()
+    )
+    if client_context is not None:
+        client_context.purpose_notes = None
+        client_context.other_shared_context = {}
+
+    conversation.state = "active_agent"
+    conversation.active_intent = None
+    conversation.assigned_admin_id = None
+    conversation.last_inbound_at = None
+    conversation.last_outbound_at = None
+    conversation.closed_at = None
+    conversation.version += 1
+    _audit(
+        session,
+        request,
+        principal,
+        "conversation.messages_reset",
+        "conversation",
+        conversation_id,
+        after={"deleted_message_count": len(message_ids), "cleared_requirement_count": len(requirement_ids)},
+    )
+    session.commit()
+    return {
+        "conversation_id": str(conversation_id),
+        "deleted_message_count": len(message_ids),
+        "deleted_agent_run_count": len(run_ids),
+        "cleared_requirement_count": len(requirement_ids),
+        "memory_reset": True,
+    }
 
 
 @router.get("/contacts/{contact_id}/context")

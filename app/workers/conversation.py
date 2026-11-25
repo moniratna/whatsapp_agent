@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import Settings
@@ -35,6 +36,120 @@ from app.integrations.bedrock.provider import LlmPort
 from app.skills.loader import load_skills, select_skill
 
 logger = logging.getLogger("whatsapp_assistant.conversation_worker")
+
+
+def _requirement_missing_core_fields(requirement: PropertyRequirement) -> list[str]:
+    missing: list[str] = []
+    if not requirement.purpose:
+        missing.append("purpose")
+    if not requirement.locations:
+        missing.append("location")
+    if not requirement.property_type:
+        missing.append("property type")
+    bedroom_preferences = requirement.preferences or {}
+    if (
+        requirement.bedrooms_min is None
+        and requirement.bedrooms_max is None
+        and not any(
+            key in bedroom_preferences
+            for key in ("bedroom_configuration", "bedrooms", "bhk", "rooms")
+        )
+    ):
+        missing.append("bedroom configuration")
+    if requirement.budget_min is None and requirement.budget_max is None:
+        missing.append("budget")
+    if not requirement.timing_text:
+        missing.append("timing")
+    practical_preferences = {
+        key: value
+        for key, value in (requirement.preferences or {}).items()
+        if key not in {"bedroom_configuration", "bedrooms", "bhk", "rooms"}
+    }
+    if not practical_preferences and not requirement.notes:
+        missing.append("amenities or practical preferences")
+    return missing
+
+
+def _extract_explicit_budget(text: str) -> dict[str, str]:
+    """Parse a clear numeric budget from common customer wording."""
+    marker = re.search(r"\b(?:budget|price range|spend)\b", text, re.IGNORECASE)
+    segment = text[marker.end() :] if marker else text
+    segment = re.split(r"[;\n.!?]", segment, maxsplit=1)[0]
+    number = r"\d[\d,]*(?:\.\d+)?"
+    unit = r"crores?|cr|lakhs?|lacs?|lac|l|millions?|mn|thousands?|k"
+    range_match = re.search(
+        rf"({number})\s*(?:-|to)\s*({number})\s*({unit})\b",
+        segment,
+        re.IGNORECASE,
+    )
+    if range_match:
+        low, high = Decimal(range_match.group(1).replace(",", "")), Decimal(
+            range_match.group(2).replace(",", "")
+        )
+        suffix = range_match.group(3).casefold()
+        multiplier = (
+            Decimal(100_000)
+            if suffix.startswith(("lakh", "lac")) or suffix == "l"
+            else Decimal(10_000_000)
+            if suffix.startswith(("crore", "cr"))
+            else Decimal(1_000_000)
+            if suffix.startswith(("million", "mn"))
+            else Decimal(1_000)
+        )
+        return {
+            "budget_min": str(low * multiplier),
+            "budget_max": str(high * multiplier),
+        }
+    amount_match = re.search(rf"({number})\s*({unit})\b", segment, re.IGNORECASE)
+    if amount_match:
+        amount = Decimal(amount_match.group(1).replace(",", ""))
+        suffix = amount_match.group(2).casefold()
+        multiplier = (
+            Decimal(100_000)
+            if suffix.startswith(("lakh", "lac")) or suffix == "l"
+            else Decimal(10_000_000)
+            if suffix.startswith(("crore", "cr"))
+            else Decimal(1_000_000)
+            if suffix.startswith(("million", "mn"))
+            else Decimal(1_000)
+        )
+        return {"budget_max": str(amount * multiplier)}
+    # A plain number is safe only when the customer also gave an explicit currency.
+    if re.search(r"(?:₹|\b(?:INR|USD|EUR|GBP|AED|CAD|AUD)\b)", segment, re.IGNORECASE):
+        amount_match = re.search(number, segment)
+        if amount_match:
+            amount = Decimal(amount_match.group().replace(",", ""))
+            return {"budget_max": str(amount)}
+    return {}
+
+
+def _is_contextual_reply(text: str, previous_assistant_message: str = "") -> bool:
+    """Keep direct answers in context while routing unknown questions to review."""
+    normalized = text.casefold().strip()
+    words = re.findall(r"[a-z0-9']+", normalized)
+    if not words or "?" in normalized:
+        return False
+    if words[0] in {
+        "what", "why", "how", "when", "where", "who", "can", "could", "would",
+        "will", "is", "are", "do", "does", "did", "should",
+    }:
+        return False
+    unsupported_markers = (
+        "guarantee", "worth", "value", "price", "return", "forecast", "predict", "appreciation",
+        "profit", "roi", "available", "availability", "recommend", "legal", "lawyer", "tax", "mortgage",
+    )
+    if any(marker in normalized for marker in unsupported_markers):
+        return False
+    return len(words) <= 4 or previous_assistant_message.rstrip().endswith("?")
+
+
+def _is_unverified_claim_request(text: str) -> bool:
+    normalized = text.casefold()
+    markers = (
+        "guarantee", "worth", "future value", "appreciation", "forecast", "predict",
+        "roi", "return on investment", "investment return", "profit",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 class ConversationWorker:
@@ -139,14 +254,133 @@ class ConversationWorker:
             return True
         try:
             skills = load_skills(self.skill_directory)
-            skill = select_skill(message.body_text or "", skills)
-            started_at = datetime.now(UTC)
-            decision = self.llm.decide(
-                skill=skill,
-                inbound=message.body_text or "[message has no text; human review required]",
-                transcript=transcript,
-                context=known_context,
+            inbound_text = (message.body_text or "").strip()
+            skill = (
+                skills["unknown"]
+                if _is_unverified_claim_request(inbound_text)
+                else select_skill(inbound_text, skills)
             )
+            active_requirement_context = next(
+                (
+                    item
+                    for item in known_context
+                    if item.get("kind") == "active_property_requirement"
+                ),
+                None,
+            )
+            active_transaction = next(
+                (
+                    item.get("transaction_type")
+                    for item in known_context
+                    if item.get("kind") == "active_property_requirement"
+                ),
+                None,
+            )
+            previous_assistant_message = next(
+                (
+                    turn.get("text", "")
+                    for turn in reversed(transcript[:-1])
+                    if turn.get("role") == "assistant"
+                ),
+                "",
+            )
+            contextual_reply = _is_contextual_reply(
+                inbound_text, previous_assistant_message
+            )
+            if skill.header.key != "unknown":
+                if active_transaction == "buy":
+                    skill = skills["buyer"]
+                elif active_transaction == "sell":
+                    skill = skills["seller"]
+            elif contextual_reply:
+                # Direct answers continue the brief, but unknown questions
+                # stay on the handover path even during an active buying/selling chat.
+                if active_transaction == "buy":
+                    skill = skills["buyer"]
+                elif active_transaction == "sell":
+                    skill = skills["seller"]
+            if skill.header.key == "unknown" and contextual_reply:
+                for turn in reversed(transcript[:-1]):
+                    if turn.get("role") != "user":
+                        continue
+                    prior_skill = select_skill(turn.get("text", ""), skills)
+                    if prior_skill.header.key != "unknown":
+                        skill = prior_skill
+                        break
+            started_at = datetime.now(UTC)
+            is_acknowledgement = inbound_text.casefold().strip("!.,? ") in {
+                "yes",
+                "yeah",
+                "yep",
+                "yup",
+                "ok",
+                "okay",
+                "thanks",
+                "thank you",
+                "got it",
+            }
+            last_assistant_text = next(
+                (
+                    turn.get("text", "").casefold()
+                    for turn in reversed(transcript[:-1])
+                    if turn.get("role") == "assistant"
+                ),
+                "",
+            )
+            assistant_already_closed = any(
+                phrase in last_assistant_text
+                for phrase in (
+                    "key details for your search",
+                    "our team will connect with you shortly",
+                    "thanks, i have the key details",
+                )
+            )
+            if (
+                (
+                    active_requirement_context
+                    and active_requirement_context.get("intake_complete")
+                    or assistant_already_closed
+                )
+                and is_acknowledgement
+            ):
+                from app.integrations.bedrock.provider import AssistantDecision
+
+                decision = AssistantDecision(
+                    decision="answer",
+                    response_text=(
+                        "Thanks! Our team will connect with you shortly to discuss the next steps."
+                    ),
+                    intent=active_transaction
+                    or {"buyer": "buy", "seller": "sell", "portfolio": "portfolio"}.get(
+                        skill.header.intent, "general"
+                    ),
+                    confidence=0.95,
+                )
+            else:
+                decision = self.llm.decide(
+                    skill=skill,
+                    inbound=message.body_text or "[message has no text; human review required]",
+                    transcript=transcript,
+                    context=known_context,
+                )
+            from app.integrations.bedrock.provider import AssistantDecision
+
+            if skill.header.key == "unknown" and decision.decision != "handover":
+                decision = decision.model_copy(update={
+                    "decision": "handover",
+                    "response_text": "",
+                    "handover_reason": "unknown_question",
+                    "intent": "unknown",
+                    "confidence": min(decision.confidence, 0.2),
+                    "proposed_facts": [],
+                })
+            expected_intent = {"buyer": "buy", "seller": "sell"}.get(skill.header.intent)
+            if (
+                isinstance(decision, AssistantDecision)
+                and expected_intent is not None
+                and decision.intent not in {expected_intent, "mixed"}
+            ):
+                decision = decision.model_copy(update={"intent": expected_intent})
             elapsed_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
             logger.info(
                 "conversation_model_completed event_id=%s skill=%s decision=%s "
@@ -177,6 +411,38 @@ class ConversationWorker:
             decision=decision,
             mode=mode,
             elapsed_ms=elapsed_ms,
+            interactive_payload=(
+                {
+                    "type": "list",
+                    "body": (
+                        "Hi, I’m Varun. I help with property enquiries. Are you looking to "
+                        "buy, rent, invest, sell, or discuss a property you own?"
+                    ),
+                    "title": "Property enquiry",
+                    "buttonLabel": "Choose an option",
+                    "sections": [
+                        {
+                            "title": "I’m looking to…",
+                            "rows": [
+                                {"id": "buy", "title": "Buy"},
+                                {"id": "rent", "title": "Rent"},
+                                {"id": "invest", "title": "Invest"},
+                                {"id": "sell", "title": "Sell"},
+                                {"id": "own_property", "title": "Discuss my property"},
+                            ],
+                        }
+                    ],
+                }
+                if self.settings.openwa_interactive_enabled
+                and skill.header.key == "general"
+                # The current inbound greeting is included as the last transcript item.
+                # Only show the introductory menu when this is the first message in
+                # the conversation; returning users should continue from their history.
+                and len(transcript) == 1
+                and (message.body_text or "").strip().casefold().strip("!.,? ")
+                in {"hi", "hello", "hey", "hii", "hiii"}
+                else None
+            ),
         )
         return True
 
@@ -266,7 +532,7 @@ class ConversationWorker:
                     select(Message)
                     .where(Message.conversation_id == conversation.id)
                     .order_by(Message.created_at.desc(), Message.id.desc())
-                    .limit(12)
+                    .limit(40)
                 )
             )
             messages.reverse()
@@ -300,6 +566,51 @@ class ConversationWorker:
                 }
                 for fact in facts
             ]
+            active_requirement = session.scalar(
+                select(PropertyRequirement)
+                .where(
+                    PropertyRequirement.contact_id == contact.id,
+                    PropertyRequirement.status == "active",
+                    exists().where(
+                        ContextFact.entity_type == "requirement",
+                        ContextFact.entity_id == PropertyRequirement.id,
+                        ContextFact.superseded_at.is_(None),
+                    ),
+                )
+                .order_by(PropertyRequirement.updated_at.desc())
+                .limit(1)
+            )
+            if active_requirement is not None:
+                requirement_context = {
+                    "kind": "active_property_requirement",
+                    "transaction_type": active_requirement.transaction_type,
+                    "purpose": active_requirement.purpose,
+                    "locations": active_requirement.locations,
+                    "property_type": active_requirement.property_type,
+                    "budget_min": (
+                        str(active_requirement.budget_min)
+                        if active_requirement.budget_min is not None
+                        else None
+                    ),
+                    "budget_max": (
+                        str(active_requirement.budget_max)
+                        if active_requirement.budget_max is not None
+                        else None
+                    ),
+                    "currency": active_requirement.currency,
+                    "bedrooms_min": active_requirement.bedrooms_min,
+                    "bedrooms_max": active_requirement.bedrooms_max,
+                    "timing_text": active_requirement.timing_text,
+                    "preferences": active_requirement.preferences,
+                    "notes": active_requirement.notes,
+                    "match_readiness": active_requirement.match_readiness,
+                }
+                missing_core = _requirement_missing_core_fields(active_requirement)
+                if active_requirement.match_readiness == "ready":
+                    missing_core = []
+                requirement_context["missing_core_fields"] = missing_core
+                requirement_context["intake_complete"] = not missing_core
+                known_context.append(requirement_context)
             client_context = session.scalar(
                 select(ClientContext).where(ClientContext.contact_id == contact.id)
             )
@@ -374,6 +685,7 @@ class ConversationWorker:
         decision: object,
         mode: str,
         elapsed_ms: int,
+        interactive_payload: dict[str, Any] | None = None,
     ) -> None:
         from app.integrations.bedrock.provider import AssistantDecision
 
@@ -451,6 +763,8 @@ class ConversationWorker:
             )
             session.add(run)
             session.flush()
+            message.sentiment = decision.sentiment
+            message.sentiment_confidence = Decimal(str(decision.sentiment_confidence))
             fact_conflict = self._apply_proposed_facts(
                 session,
                 locked_contact,
@@ -459,6 +773,26 @@ class ConversationWorker:
                 decision,
                 now,
             )
+            active_requirement = session.scalar(
+                select(PropertyRequirement)
+                .where(
+                    PropertyRequirement.contact_id == locked_contact.id,
+                    PropertyRequirement.status == "active",
+                    exists().where(
+                        ContextFact.entity_type == "requirement",
+                        ContextFact.entity_id == PropertyRequirement.id,
+                        ContextFact.superseded_at.is_(None),
+                    ),
+                )
+                .order_by(PropertyRequirement.updated_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if (
+                active_requirement is not None
+                and not _requirement_missing_core_fields(active_requirement)
+            ):
+                active_requirement.match_readiness = "ready"
             if (
                 decision.decision == "handover"
                 or decision.confidence < 0.65
@@ -520,10 +854,16 @@ class ConversationWorker:
                         conversation_id=locked_conversation.id,
                         sender_type="automated_agent",
                         agent_run_id=run.id,
-                        body_text=decision.response_text,
+                        body_text=(
+                            "Hi, I’m Varun. I help with property enquiries. Are you looking to "
+                            "buy, rent, invest, sell, or discuss a property you own?"
+                            if interactive_payload
+                            else decision.response_text
+                        ),
                         idempotency_key=f"agent:{run.id}",
                         skill_key=skill_key,
                         application_release=self.settings.app_release,
+                        interactive_payload=interactive_payload,
                     )
                     run.response_message_id = response.id
                     run.status = "completed"
@@ -537,6 +877,12 @@ class ConversationWorker:
                         locked_conversation.id,
                         mode,
                     )
+                    if interactive_payload is not None:
+                        logger.info(
+                            "conversation_property_menu_queued event_id=%s message_id=%s",
+                            event_id,
+                            response.id,
+                        )
                 else:
                     session.add(
                         AgentRunDraft(
@@ -579,10 +925,47 @@ class ConversationWorker:
         decision: object,
         now: datetime,
     ) -> bool:
-        from app.integrations.bedrock.provider import AssistantDecision
+        from app.integrations.bedrock.provider import AssistantDecision, ProposedFact
 
         if not isinstance(decision, AssistantDecision):
             return False
+        explicit_budget = _extract_explicit_budget(message.body_text or "")
+        proposed_facts = list(decision.proposed_facts)
+        if explicit_budget:
+            # Prefer the direct amount parsed from the customer's own wording
+            # over a less precise model extraction for this same message.
+            proposed_facts = [
+                fact
+                for fact in proposed_facts
+                if not (
+                    fact.entity_type == "requirement"
+                    and fact.field_key in explicit_budget
+                )
+            ]
+            proposed_facts.extend(
+                ProposedFact(
+                    entity_type="requirement",
+                    field_key=field_key,
+                    value=value,
+                    original_text=message.body_text or "",
+                    confidence=0.99,
+                )
+                for field_key, value in explicit_budget.items()
+            )
+        active_transaction = session.scalar(
+            select(PropertyRequirement.transaction_type)
+            .where(
+                PropertyRequirement.contact_id == contact.id,
+                PropertyRequirement.status == "active",
+                exists().where(
+                    ContextFact.entity_type == "requirement",
+                    ContextFact.entity_id == PropertyRequirement.id,
+                    ContextFact.superseded_at.is_(None),
+                ),
+            )
+            .order_by(PropertyRequirement.updated_at.desc())
+            .limit(1)
+        )
         requirement: PropertyRequirement | None = None
         asset: PortfolioAsset | None = None
         intent_map = {"buy": "buy", "sell": "sell"}
@@ -616,15 +999,15 @@ class ConversationWorker:
             },
         }
         conflict = False
-        for proposed in decision.proposed_facts:
+        for proposed in proposed_facts:
             if (
-                proposed.confidence < 0.9
+                proposed.confidence < 0.75
                 or proposed.field_key not in allowed_fields[proposed.entity_type]
             ):
                 continue
             projection: Any
             if proposed.entity_type == "requirement":
-                transaction = intent_map.get(decision.intent)
+                transaction = intent_map.get(decision.intent) or active_transaction
                 if transaction is None:
                     continue
                 if requirement is None:
@@ -634,6 +1017,11 @@ class ConversationWorker:
                             PropertyRequirement.contact_id == contact.id,
                             PropertyRequirement.transaction_type == transaction,
                             PropertyRequirement.status == "active",
+                            exists().where(
+                                ContextFact.entity_type == "requirement",
+                                ContextFact.entity_id == PropertyRequirement.id,
+                                ContextFact.superseded_at.is_(None),
+                            ),
                         )
                         .order_by(PropertyRequirement.updated_at.desc())
                         .limit(1)
@@ -710,6 +1098,8 @@ class ConversationWorker:
                 continue
             if field_key == "preferences" and not isinstance(value, dict):
                 continue
+            if field_key == "preferences":
+                value = {**(projection.preferences or {}), **value}
             if field_key in {"budget_min", "budget_max", "size_min", "size_max"}:
                 other_field = {
                     "budget_min": "budget_max",
@@ -831,11 +1221,13 @@ def run_worker() -> None:
         raise RuntimeError("fake LLM is restricted to local development")
     worker = ConversationWorker(make_session_factory(engine), provider, settings)
     logger.info(
-        "conversation_worker_started app_env=%s provider=%s model=%s settings_mode=%s",
+        "conversation_worker_started app_env=%s provider=%s model=%s settings_mode=%s "
+        "interactive_enabled=%s",
         settings.app_env,
         "bedrock" if settings.bedrock_enabled else "fake",
         settings.bedrock_model_id or "deterministic-fake",
         settings.ai_mode,
+        settings.openwa_interactive_enabled,
     )
     while True:
         if not worker.process_one():

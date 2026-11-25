@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     zoho_field_mapping_json: str = "{}"
 
     auth_mode: Literal["development", "oidc"] = "development"
+    dashboard_api_key: SecretStr = SecretStr("")
     oidc_issuer_url: str | None = None
     oidc_client_id: str | None = None
     oidc_jwks_url: str | None = None
