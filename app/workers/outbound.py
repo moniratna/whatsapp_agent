@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config.settings import Settings, get_settings
 from app.db.connection import make_engine, make_session_factory
 from app.db.models import (
+    AgentRun,
     AiRolloutAllowlist,
     Contact,
     Conversation,
@@ -235,21 +236,13 @@ class OutboundWorker:
             return "contact_opted_out"
         if message.sender_type != "automated_agent":
             return None
-        if conversation.state != "active_agent":
-            return "conversation_not_agent_owned"
-        active_handover = session.scalar(
-            select(HandoverCase.id).where(
-                HandoverCase.conversation_id == conversation.id,
-                HandoverCase.status.in_(("open", "assigned", "admin_owned")),
-            )
-        )
-        if active_handover is not None:
-            return "active_handover"
         controls = session.get(RuntimeControl, 1)
         if controls is None:
             return "runtime_controls_missing"
         if controls.kill_switch:
             return "ai_kill_switch_enabled"
+        if controls.ai_mode not in {"active", "canary"}:
+            return "ai_mode_blocks_automatic_send"
         if controls.ai_mode == "canary":
             allowlisted = session.scalar(
                 select(AiRolloutAllowlist.id).where(
@@ -262,9 +255,34 @@ class OutboundWorker:
             )
             if allowlisted is None:
                 return "contact_not_on_canary_allowlist"
+        if message.message_type == "handover_ack":
+            run = session.get(AgentRun, message.agent_run_id) if message.agent_run_id else None
+            active_handover = session.scalar(
+                select(HandoverCase.id).where(
+                    HandoverCase.conversation_id == conversation.id,
+                    HandoverCase.status.in_(("open", "assigned", "admin_owned")),
+                )
+            )
+            if (
+                conversation.state != "admin_owned"
+                or active_handover is None
+                or run is None
+                or run.status != "handed_over"
+                or run.decision_type != "handover"
+                or run.response_message_id != message.id
+            ):
+                return "invalid_handover_acknowledgement"
             return None
-        if controls.ai_mode != "active":
-            return "ai_mode_blocks_automatic_send"
+        if conversation.state != "active_agent":
+            return "conversation_not_agent_owned"
+        active_handover = session.scalar(
+            select(HandoverCase.id).where(
+                HandoverCase.conversation_id == conversation.id,
+                HandoverCase.status.in_(("open", "assigned", "admin_owned")),
+            )
+        )
+        if active_handover is not None:
+            return "active_handover"
         return None
 
     @staticmethod

@@ -410,6 +410,7 @@ class ConversationWorker:
             skill_key=skill.header.key,
             decision=decision,
             mode=mode,
+            kill_switch=kill_switch,
             elapsed_ms=elapsed_ms,
             interactive_payload=(
                 {
@@ -684,6 +685,7 @@ class ConversationWorker:
         skill_key: str,
         decision: object,
         mode: str,
+        kill_switch: bool,
         elapsed_ms: int,
         interactive_payload: dict[str, Any] | None = None,
     ) -> None:
@@ -826,6 +828,39 @@ class ConversationWorker:
                 run.status = "handed_over"
                 run.decision_type = "handover"
                 run.handover_reason = case.reason_code
+                ack_allowed = (
+                    locked_contact.consent_status != "opted_out"
+                    and not kill_switch
+                    and mode in {"active", "canary"}
+                )
+                if ack_allowed and mode == "canary":
+                    allowlisted = session.scalar(
+                        select(AiRolloutAllowlist.id).where(
+                            AiRolloutAllowlist.contact_id == locked_contact.id,
+                            or_(
+                                AiRolloutAllowlist.expires_at.is_(None),
+                                AiRolloutAllowlist.expires_at > now,
+                            ),
+                        )
+                    )
+                    ack_allowed = allowlisted is not None
+                if ack_allowed:
+                    acknowledgement, _ = enqueue_outbound_message(
+                        session,
+                        conversation_id=locked_conversation.id,
+                        sender_type="automated_agent",
+                        agent_run_id=run.id,
+                        body_text="I’ll ask a team member to check this and get back to you.",
+                        idempotency_key=f"agent-handover-ack:{run.id}",
+                    )
+                    acknowledgement.message_type = "handover_ack"
+                    run.response_message_id = acknowledgement.id
+                    logger.info(
+                        "conversation_handover_ack_queued event_id=%s run_id=%s message_id=%s",
+                        event_id,
+                        run.id,
+                        acknowledgement.id,
+                    )
                 logger.info(
                     "conversation_handover_created event_id=%s run_id=%s conversation_id=%s "
                     "reason=%s confidence=%.3f",

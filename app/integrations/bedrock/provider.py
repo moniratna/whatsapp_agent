@@ -8,6 +8,7 @@ from typing import Literal, Protocol
 import boto3  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.analytics.sentiment import classify_sentiment
 from app.config.settings import Settings
 from app.skills.loader import Skill
 
@@ -143,10 +144,7 @@ class FakeLlm:
         del transcript
         del context
         question = inbound.casefold()
-        frustrated = any(word in question for word in ("frustrated", "annoyed", "angry", "ridiculous", "waste of time"))
-        negative = any(word in question for word in ("bad", "disappointed", "unhappy", "problem", "issue", "not good"))
-        positive = any(word in question for word in ("great", "good", "love", "excellent", "happy", "thank you"))
-        sentiment = "frustrated" if frustrated else "negative" if negative else "positive" if positive else "neutral"
+        sentiment, sentiment_confidence = classify_sentiment(inbound)
         risky = any(
             word in question for word in ("lawyer", "legal", "complaint", "refund", "urgent human")
         )
@@ -158,7 +156,7 @@ class FakeLlm:
                 intent="unknown",
                 confidence=0.2,
                 sentiment=sentiment,
-                sentiment_confidence=0.75 if sentiment != "neutral" else 0.6,
+                sentiment_confidence=sentiment_confidence,
             )
         return AssistantDecision(
             decision="answer",
@@ -171,7 +169,7 @@ class FakeLlm:
             ),
             confidence=0.8,
             sentiment=sentiment,
-            sentiment_confidence=0.75 if sentiment != "neutral" else 0.6,
+            sentiment_confidence=sentiment_confidence,
         )
 
 

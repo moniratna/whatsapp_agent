@@ -30,6 +30,8 @@ Restarting workers is safe: committed inbound messages remain in PostgreSQL; app
 
 Exact inbound `STOP`, `STOP ALL`, `UNSUBSCRIBE`, `CANCEL`, `END`, and `QUIT` commands immediately opt the contact out, open or retain a handover, and pause automation. All sends (including admin sends) are blocked while opted out because the human-response policy has not been approved. An admin may restore consent only by referencing an inbound `START` or `UNSTOP` command and recording a reason; this does not resume automation. Explicit hand-back is still required. Business approval is required before changing this conservative policy.
 
+When a normal handover is created, the conversation worker queues one brief automated acknowledgement only when runtime controls allow automated sends (`active`, or an allowlisted `canary` contact with the kill switch off). The outbound worker validates this acknowledgement against its handover run and active handover record. No acknowledgement is sent for opted-out contacts or while automation is in `shadow`, `assisted`, or `off` mode.
+
 ## Exports and learning review
 
 Exports default to de-identified JSONL, redact common phone/email/URL/name/address patterns, omit private admin notes, and are available only to supervisors. Redaction is pattern-based and should be treated as a best-effort safeguard, not a substitute for an approved privacy review. Local files are mode `0600` in a mode `0700` directory. Staging/production write to the configured private S3 prefix using server-side encryption; configure bucket lifecycle/IAM and backups consistently with the business retention policy. The default export TTL is 24 hours and must be approved for production.
