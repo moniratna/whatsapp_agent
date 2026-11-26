@@ -72,7 +72,18 @@ class SkillUpdateWorker:
 
     def process_one(self, *, now: datetime | None = None) -> bool:
         if not self.settings.skill_updates_enabled:
+            logger.info("skill_update_worker_idle reason=skill_updates_disabled")
             return False
+        logger.debug(
+            "skill_update_worker_config extraction_enabled=%s candidate_writes_enabled=%s "
+            "consolidation_enabled=%s auto_merge_enabled=%s schedule_minutes=%s batch_size=%s",
+            self.settings.skill_update_extraction_enabled,
+            self.settings.skill_update_candidate_writes_enabled,
+            self.settings.skill_update_consolidation_enabled,
+            self.settings.skill_update_auto_merge_enabled,
+            self.settings.skill_update_schedule_minutes,
+            self.settings.skill_update_batch_size,
+        )
         at = self._utc(now or datetime.now(UTC))
         self._ensure_services()
         self._expire_snapshots(at)
@@ -146,10 +157,18 @@ class SkillUpdateWorker:
             session.add(run)
             session.flush()
             logger.info(
-                "skill_update_run_queued run_id=%s schedule_minutes=%s batch_size=%s",
+                "skill_update_run_queued run_id=%s schedule_minutes=%s batch_size=%s "
+                "extraction_enabled=%s candidate_writes_enabled=%s consolidation_enabled=%s "
+                "model_configured=%s min_confidence=%.3f input_limit_bytes=%s",
                 run.id,
                 self.settings.skill_update_schedule_minutes,
                 self.settings.skill_update_batch_size,
+                self.settings.skill_update_extraction_enabled,
+                self.settings.skill_update_candidate_writes_enabled,
+                self.settings.skill_update_consolidation_enabled,
+                bool(self.settings.bedrock_model_id),
+                self.settings.skill_update_min_confidence,
+                self.settings.skill_update_model_input_max_bytes,
             )
 
     def _advance_run(self, now: datetime) -> bool:
@@ -254,22 +273,43 @@ class SkillUpdateWorker:
                 run.selection_json = updated
             selected = page.conversations
         logger.info(
-            "skill_update_selection_page run_id=%s selected=%s active_agent=%s admin_owned=%s closed=%s "
-            "has_more=%s window_start=%s window_end=%s",
+            "skill_update_selection_page run_id=%s selected=%s active_agent=%s "
+            "admin_owned=%s closed=%s "
+            "has_more=%s cursor_in=%s cursor_out=%s window_start=%s window_end=%s",
             run_id,
             len(selected),
             sum(item.conversation_state == "active_agent" for item in selected),
             sum(item.conversation_state == "admin_owned" for item in selected),
             sum(item.conversation_state == "closed" for item in selected),
             page.has_more,
+            cursor.to_json() if cursor else "none",
+            page.cursor_out.to_json() if page.cursor_out else "none",
             page.window_start.isoformat(),
             page.window_end.isoformat(),
         )
+        if not selected:
+            logger.info(
+                "skill_update_selection_empty run_id=%s has_more=%s "
+                "window_start=%s window_end=%s",
+                run_id,
+                page.has_more,
+                page.window_start.isoformat(),
+                page.window_end.isoformat(),
+            )
         assert self.storage is not None and self.extractor is not None
         for item in selected:
             try:
                 with self.session_factory() as session:
                     snapshot = builder.build(session, item, now=now)
+                logger.debug(
+                    "skill_update_snapshot_built run_id=%s conversation_id=%s "
+                    "snapshot_id=%s message_count=%s source_type=%s",
+                    run_id,
+                    item.conversation_id,
+                    snapshot.snapshot_id,
+                    len(snapshot.messages),
+                    snapshot.source_type,
+                )
                 processed = state.get("processed_snapshots", {}).get(str(item.conversation_id))
                 if (
                     isinstance(processed, dict)
@@ -309,6 +349,13 @@ class SkillUpdateWorker:
                     self._reason_code(exc),
                 )
                 self._record_skip(run_id, item.conversation_id, "no_longer_eligible")
+            except Exception:
+                logger.exception(
+                    "skill_update_conversation_failed run_id=%s conversation_id=%s",
+                    run_id,
+                    item.conversation_id,
+                )
+                raise
         with self.session_factory.begin() as session:
             run = session.get(SkillUpdateRun, run_id)
             if run is None:
@@ -517,7 +564,10 @@ class SkillUpdateWorker:
             return
         candidates_root = self.storage.root / "candidates"
         for source_type in SOURCE_TYPES:
-            for path in sorted(candidates_root.joinpath(source_type).glob("*_conversation_skill_*.md")):
+            candidate_glob = candidates_root.joinpath(source_type).glob(
+                "*_conversation_skill_*.md"
+            )
+            for path in sorted(candidate_glob):
                 match = re.fullmatch(
                     rf"{re.escape(source_type)}_conversation_skill_(\d+)\.md", path.name
                 )

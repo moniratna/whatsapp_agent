@@ -1276,6 +1276,13 @@ class ConversationWorker:
                 "portfolio_notes",
             },
         }
+        string_field_limits = {
+            "property_type": 64,
+            "ownership_status": 64,
+            "purpose": 128,
+            "size_unit": 24,
+            "timing_text": 512,
+        }
         conflict = False
         for proposed, source_message_id in proposed_with_sources:
             if (
@@ -1379,6 +1386,16 @@ class ConversationWorker:
                 "portfolio_notes",
             } and not isinstance(value, str):
                 continue
+            if field_key in string_field_limits:
+                value = value.strip()
+                if not value or len(value) > string_field_limits[field_key]:
+                    logger.warning(
+                        "conversation_fact_rejected_invalid_length field_key=%s length=%s max=%s",
+                        field_key,
+                        len(value),
+                        string_field_limits[field_key],
+                    )
+                    continue
             if field_key == "locations" and isinstance(value, str):
                 value = [{"label": value, "source_text": proposed.original_text}]
             if field_key == "locations" and not isinstance(value, list):

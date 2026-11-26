@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -35,7 +35,6 @@ from app.skill_updates.schemas import (
     ExistingLearning,
     LearningReviewOutput,
     LearningReviewRequest,
-    SourceType,
 )
 from app.skill_updates.selection import source_type_for_intent_or_requirement
 from app.skill_updates.snapshots import ConversationSnapshot
@@ -139,6 +138,7 @@ def _candidate_learning(markdown: str) -> str:
     return match.group(1).strip() if match else markdown
 
 
+
 def _contains_personal_data(values: list[str]) -> bool:
     for value in values:
         redacted = deidentify_text(value)
@@ -195,8 +195,29 @@ class SkillUpdateExtractor:
         if isinstance(snapshot_metadata, ExtractionResult):
             return snapshot_metadata
 
+        logger.info(
+            "skill_candidate_review_started run_id=%s conversation_id=%s snapshot_id=%s "
+            "source_type=%s state=%s message_count=%s input_limit_bytes=%s output_limit_bytes=%s",
+            run_id,
+            snapshot.conversation_id,
+            snapshot.snapshot_id,
+            snapshot.source_type,
+            snapshot.conversation_state,
+            len(snapshot.messages),
+            self.settings.skill_update_model_input_max_bytes,
+            self.settings.skill_update_model_output_max_bytes,
+        )
+
         existing = self._candidate_for_conversation(snapshot.conversation_id)
         if existing is not None:
+            logger.info(
+                "skill_candidate_review_blocked run_id=%s conversation_id=%s "
+                "reason=candidate_already_exists candidate_id=%s candidate_status=%s",
+                run_id,
+                snapshot.conversation_id,
+                existing.id,
+                existing.status,
+            )
             recovered = self._recover_writing_candidate(existing, snapshot, run_id)
             if recovered is not None:
                 return recovered
@@ -228,23 +249,22 @@ class SkillUpdateExtractor:
             )
             return ExtractionResult("rejected", "active_skill_unavailable")
         if current_hashes != snapshot.pins.skill_hashes:
+            logger.warning(
+                "skill_candidate_review_blocked run_id=%s conversation_id=%s "
+                "reason=active_skill_version_changed",
+                run_id,
+                snapshot.conversation_id,
+            )
             self._record_outcome(
                 run_id, snapshot.conversation_id, "rejected", "active_skill_version_changed"
             )
             return ExtractionResult("rejected", "active_skill_version_changed")
 
-        try:
-            pending = self._pending_learnings()
-        except (ArtifactStorageError, ArtifactIntegrityError):
-            self._record_outcome(
-                run_id, snapshot.conversation_id, "rejected", "candidate_comparison_unavailable"
-            )
-            return ExtractionResult("rejected", "candidate_comparison_unavailable")
         existing_learnings = [
             ExistingLearning(source_type=source_type, status="active", text=skill.instructions)
             for source_type, skill in active_skills.items()
             if source_type != "skill_reviewer"
-        ] + pending
+        ]
         request = LearningReviewRequest(
             source_conversation_type=snapshot.source_type,
             snapshot=snapshot.payload(),
@@ -256,7 +276,24 @@ class SkillUpdateExtractor:
             existing_learnings=existing_learnings,
         )
         request_json = json.dumps(request.model_dump(mode="json"), ensure_ascii=False)
+        logger.info(
+            "skill_candidate_reviewer_request run_id=%s conversation_id=%s "
+            "request_bytes=%s message_count=%s active_skill_count=%s",
+            run_id,
+            snapshot.conversation_id,
+            len(request_json.encode()),
+            len(snapshot.messages),
+            len(existing_learnings),
+        )
         if len(request_json.encode()) > self.settings.skill_update_model_input_max_bytes:
+            logger.warning(
+                "skill_candidate_review_blocked run_id=%s conversation_id=%s "
+                "reason=model_input_too_large request_bytes=%s max_bytes=%s",
+                run_id,
+                snapshot.conversation_id,
+                len(request_json.encode()),
+                self.settings.skill_update_model_input_max_bytes,
+            )
             self._record_outcome(
                 run_id, snapshot.conversation_id, "rejected", "model_input_too_large"
             )
@@ -264,6 +301,19 @@ class SkillUpdateExtractor:
         try:
             raw_output = self.reviewer.review(request)
             output = self._parse_output(raw_output)
+            logger.info(
+                "skill_candidate_reviewer_response run_id=%s conversation_id=%s "
+                "status=%s confidence=%.3f novelty=%s policy_conflict_count=%s "
+                "evidence_count=%s regression_case_count=%s",
+                run_id,
+                snapshot.conversation_id,
+                output.status,
+                output.confidence,
+                output.duplicate_or_novel,
+                len(output.policy_conflicts),
+                len(output.evidence_refs),
+                len(output.regression_cases),
+            )
         except Exception as exc:
             logger.exception(
                 "skill_update_model_review_failed run_id=%s conversation_id=%s "
@@ -281,9 +331,24 @@ class SkillUpdateExtractor:
         outcome = self._validate_output(output, snapshot)
         if outcome is not None:
             status, reason = outcome
+            logger.info(
+                "skill_candidate_review_rejected run_id=%s conversation_id=%s "
+                "status=%s reason=%s confidence=%.3f min_confidence=%.3f",
+                run_id,
+                snapshot.conversation_id,
+                status,
+                reason,
+                output.confidence,
+                self.settings.skill_update_min_confidence,
+            )
             self._record_outcome(run_id, snapshot.conversation_id, status, reason)
             return ExtractionResult(status, reason)
         if output.status == "no_learning":
+            logger.info(
+                "skill_candidate_review_no_learning run_id=%s conversation_id=%s",
+                run_id,
+                snapshot.conversation_id,
+            )
             self._record_outcome(
                 run_id, snapshot.conversation_id, "no_candidate", "no_reusable_learning"
             )
@@ -293,23 +358,40 @@ class SkillUpdateExtractor:
         current_bodies = [
             skill.instructions for key, skill in active_skills.items() if key != "skill_reviewer"
         ]
-        pending_bodies = [item.text for item in pending]
-        if any(
-            _is_semantic_duplicate(learning_text, body) for body in current_bodies + pending_bodies
-        ):
-            self._record_outcome(
-                run_id, snapshot.conversation_id, "duplicate", "duplicate_active_or_pending"
+        if any(_is_semantic_duplicate(learning_text, body) for body in current_bodies):
+            logger.info(
+                "skill_candidate_duplicate run_id=%s conversation_id=%s "
+                "reason=duplicate_active_skill",
+                run_id,
+                snapshot.conversation_id,
             )
-            return ExtractionResult("duplicate", "duplicate_active_or_pending")
+            self._record_outcome(
+                run_id, snapshot.conversation_id, "duplicate", "duplicate_active_skill"
+            )
+            return ExtractionResult("duplicate", "duplicate_active_skill")
 
         fingerprint = learning_fingerprint(output.lesson, output.trigger, output.instruction)
         if self._fingerprint_exists(fingerprint):
+            logger.info(
+                "skill_candidate_duplicate run_id=%s conversation_id=%s "
+                "reason=duplicate_fingerprint fingerprint=%s",
+                run_id,
+                snapshot.conversation_id,
+                fingerprint,
+            )
             self._record_outcome(
                 run_id, snapshot.conversation_id, "duplicate", "duplicate_fingerprint"
             )
             return ExtractionResult("duplicate", "duplicate_fingerprint", fingerprint=fingerprint)
 
         if not self.settings.skill_update_candidate_writes_enabled:
+            logger.warning(
+                "skill_candidate_not_written run_id=%s conversation_id=%s "
+                "reason=candidate_writes_disabled fingerprint=%s",
+                run_id,
+                snapshot.conversation_id,
+                fingerprint,
+            )
             self._record_outcome(
                 run_id,
                 snapshot.conversation_id,
@@ -366,6 +448,14 @@ class SkillUpdateExtractor:
             if artifact is None:
                 artifact = self.storage.write_candidate(snapshot.source_type, sequence, markdown)
         except (ArtifactStorageError, ArtifactIntegrityError):
+            logger.exception(
+                "skill_candidate_file_write_failed run_id=%s conversation_id=%s "
+                "candidate_id=%s sequence=%s",
+                run_id,
+                snapshot.conversation_id,
+                candidate_id,
+                sequence,
+            )
             self._record_outcome(
                 run_id, snapshot.conversation_id, "failed", "candidate_file_write_failed"
             )
@@ -373,6 +463,16 @@ class SkillUpdateExtractor:
                 "failed", "candidate_file_write_failed", candidate_id, fingerprint=fingerprint
             )
         result = self._finalize_candidate(candidate_id, run_id, snapshot, artifact, fingerprint)
+        logger.info(
+            "skill_candidate_file_result run_id=%s conversation_id=%s status=%s "
+            "candidate_id=%s relative_path=%s fingerprint=%s",
+            run_id,
+            snapshot.conversation_id,
+            result.status,
+            result.candidate_id or "none",
+            result.relative_path or artifact.relative_path,
+            fingerprint,
+        )
         return result
 
     def _load_run_and_snapshot(
@@ -438,39 +538,6 @@ class SkillUpdateExtractor:
             entry,
             candidate.content_fingerprint or "",
         )
-
-    def _pending_learnings(self) -> list[ExistingLearning]:
-        with self.session_factory() as session:
-            candidates = list(
-                session.scalars(
-                    select(SkillCandidateFile)
-                    .where(
-                        SkillCandidateFile.candidate_type == "customer_skill",
-                        SkillCandidateFile.status.in_(("pending", "claimed")),
-                    )
-                    .order_by(SkillCandidateFile.created_at, SkillCandidateFile.id)
-                )
-            )
-        learnings: list[ExistingLearning] = []
-        for candidate in candidates:
-            if candidate.sha256 is None or candidate.source_conversation_type is None:
-                raise ArtifactIntegrityError("pending candidate metadata is incomplete")
-            entry = CandidateManifestEntry(
-                source_type=candidate.source_conversation_type,
-                sequence=candidate.sequence,
-                relative_path=candidate.relative_path,
-                sha256=candidate.sha256,
-            )
-            markdown = self.storage.read_candidate(entry)
-            learnings.append(
-                ExistingLearning(
-                    source_type=cast(SourceType, candidate.source_conversation_type),
-                    status="pending",
-                    text=_candidate_learning(markdown),
-                    fingerprint=candidate.content_fingerprint,
-                )
-            )
-        return learnings
 
     def _parse_output(self, raw: object) -> LearningReviewOutput:
         if isinstance(raw, LearningReviewOutput):

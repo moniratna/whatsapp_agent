@@ -238,7 +238,9 @@ class BedrockLlm:
                 "use only property_type, locations, budget_min, budget_max, currency, "
                 "bedrooms_min, bedrooms_max, size_min, size_max, size_unit, timing_text, purpose, "
                 "preferences, or notes. Infer currency from a clear property location rather than "
-                "asking the customer for it.",
+                "asking the customer for it. Return concise canonical values for categorical fields: "
+                "property_type should be a short type such as 'apartment', not a sentence or preference; "
+                "put alternatives and descriptive detail in preferences or notes.",
             ],
         }
         system_text = (
