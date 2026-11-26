@@ -114,9 +114,15 @@ class Settings(BaseSettings):
                 Path("/var/tmp").resolve(),
                 Path("/private/tmp").resolve(),
             }
-            if storage_dir == project_root or project_root in storage_dir.parents:
+            private_candidate_dir = (project_root / "skills" / "candidate_skills").resolve(
+                strict=False
+            )
+            if (storage_dir == project_root) or (
+                project_root in storage_dir.parents and storage_dir != private_candidate_dir
+            ):
                 raise ValueError(
-                    "SKILL_UPDATE_STORAGE_DIR must be outside the application repository"
+                    "SKILL_UPDATE_STORAGE_DIR inside the repository must be "
+                    "skills/candidate_skills"
                 )
             if self.app_env != "test" and any(
                 storage_dir == root or root in storage_dir.parents for root in temp_roots

@@ -1,6 +1,6 @@
 ---
 key: buyer
-release: 11
+release: 12
 intent: buyer
 triggers: [buy, buying, purchase, rent, renting, rental, lease, leasing, invest, investment, investing, rental yield, looking for, budget, bedrooms, bedroom count, bhk, location priority, location, area, neighborhood, neighbourhood, community, amenities, gym, swimming pool, pool, parking, balcony, lift, elevator, furnishing, commute, schools, transport, accessibility, preference, priorities]
 required_fields: [transaction_type, locations]
@@ -72,3 +72,23 @@ Respect a customer's clear signal that they are finished, including "nothing rig
 **Trigger:** User replies with multiple area options separated by "or" (e.g., "Surat or Gandhinagar").
 
 **Instruction:** Acknowledge the options and ask the customer to specify which area they prefer or if both are acceptable, e.g., "Do you have a preference between Surat and Gandhinagar, or are both suitable for you?"
+
+## Reviewed learnings
+
+### After collecting core details for a commercial property (purpose, location, type, size, budget, and timeline), the agent should ask a focused follow‑up about functional requirements specific to commercial spaces (e.g., loading dock, ceiling height, power supply, parking, security) before moving to a generic "what else would you like me to know" or concluding the intake.
+
+**Trigger:** User has provided purpose (buy), location (Goa), property type (godown), size (5000 sq ft), budget (1 cr‑1.45 cr INR), and purchase timeline (within 3 months).
+
+**Instruction:** Ask a concise, targeted question such as "Do you have any specific functional requirements for the godown, like loading dock access, ceiling height, power capacity, or parking?" to capture commercial‑specific amenities before proceeding.
+
+### When a buyer requests to change their location preference, acknowledge the request, ask for the new preferred location (or clarification if needed), and update the saved preference without handing over or ending the intake flow.
+
+**Trigger:** User asks to change the location preference (e.g., "Can we change the location preference?")
+
+**Instruction:** Respond with a confirmation and request the new location (e.g., "Sure, which location would you prefer instead?") and record the updated preference; do not hand over or close the conversation.
+
+### When a user replies with a placeholder like "[ADDRESS]" after being asked for a location, the agent should treat it as the provided location, acknowledge it, and proceed to the next intake question without asking for clarification about the placeholder.
+
+**Trigger:** User replies with "[ADDRESS]" as the location response.
+
+**Instruction:** Acknowledge the placeholder location (e.g., "Got it, an [ADDRESS].") and continue the intake by asking the next prioritized question (such as bedroom count) without requesting clarification on the placeholder.

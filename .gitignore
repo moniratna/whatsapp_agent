@@ -12,3 +12,4 @@ dist/
 build/
 var/private_exports/
 .frontend
+/skills/candidate_skills/

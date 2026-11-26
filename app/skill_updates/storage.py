@@ -144,8 +144,9 @@ def _validate_candidate_markdown(content: str, source_type: str, max_bytes: int)
 class CandidateStorage:
     """Constrained filesystem adapter for inactive candidate and work artifacts.
 
-    The storage root must already be mounted, outside the repository and temp
-    directories, and private to the service account. Public methods accept
+    The storage root must already exist, be either the dedicated ignored
+    repository candidate directory or an external location, avoid temp
+    directories, and be private to the service account. Public methods accept
     source types, sequences, or safe work names; callers cannot supply arbitrary
     filesystem paths.
     """
@@ -169,8 +170,13 @@ class CandidateStorage:
             Path("/var/tmp").resolve(),
             Path("/private/tmp").resolve(),
         }
-        if self.root == repo_root or repo_root in self.root.parents:
-            raise ArtifactStorageError("storage root must be outside the application repository")
+        candidate_root = (repo_root / "skills" / "candidate_skills").resolve(strict=False)
+        if (self.root == repo_root) or (
+            repo_root in self.root.parents and self.root != candidate_root
+        ):
+            raise ArtifactStorageError(
+                "storage root inside the repository must be skills/candidate_skills"
+            )
         if not allow_ephemeral_for_tests and any(
             self.root == item or item in self.root.parents for item in temp_roots
         ):
