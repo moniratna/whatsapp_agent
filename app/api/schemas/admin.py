@@ -67,7 +67,7 @@ class ConsentCorrectionRequest(StrictRequest):
 
 
 class RequirementCreateRequest(StrictRequest):
-    transaction_type: Literal["buy", "sell"]
+    transaction_type: Literal["buy", "rent", "sell"]
     property_type: str | None = Field(default=None, max_length=64)
     locations: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
     budget_min: Decimal | None = Field(default=None, ge=0, max_digits=16, decimal_places=2)

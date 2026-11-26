@@ -185,7 +185,7 @@ class ConversationSnapshotBuilder:
             .join(Contact, Contact.id == Conversation.contact_id)
             .where(
                 Conversation.id == selected.conversation_id,
-                Conversation.state.in_({"closed", "active_agent"}),
+                Conversation.state.in_({"closed", "active_agent", "admin_owned"}),
             )
             .with_for_update()
         ).one_or_none()
@@ -207,7 +207,7 @@ class ConversationSnapshotBuilder:
                 raise SnapshotIneligible("conversation close state changed after selection")
             actual_selection_at = _as_utc(conversation.closed_at)
         else:
-            if conversation.state not in {"active_agent", "closed"}:
+            if conversation.state not in {"active_agent", "admin_owned", "closed"}:
                 raise SnapshotIneligible("conversation is no longer customer eligible")
             last_customer_message_at = session.scalar(
                 select(func.max(Message.created_at)).where(

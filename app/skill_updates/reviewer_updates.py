@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import boto3  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -40,6 +41,7 @@ from app.skill_updates.storage import (
 from app.skills.loader import ACTIVE_SKILL_MANIFEST, Skill, load_skills, parse_skill_text
 
 SUITE_VERSION = "reviewer-fixed-v1"
+logger = logging.getLogger("whatsapp_assistant.skill_reviewer_updates")
 _UNSAFE_CLAIM = re.compile(
     r"\b(?:guarantee(?:d)?|investment return|capital growth|valuation|legal advice|"
     r"tax advice|financing approval|property availability)\b",
@@ -109,6 +111,8 @@ class ReviewerCaseResult(BaseModel):
     evidence_accurate: bool
     policy_safe: bool
     expected_behavior_met: bool
+    confidence: float | None = None
+    confidence_adequate: bool = False
     passed: bool
 
 
@@ -128,6 +132,7 @@ class ReviewerImprovementProposer(Protocol):
         active_reviewer: Skill,
         suite: Sequence[ReviewerEvalCase],
         failed_case_ids: list[str],
+        failed_case_results: Sequence[ReviewerCaseResult] = (),
     ) -> str | None: ...
 
 
@@ -158,7 +163,25 @@ class BedrockReviewerCaseRunner:
         }
         response = self.client.converse(
             modelId=self.model_id,
-            system=[{"text": reviewer.instructions}],
+            system=[
+                {
+                    "text": (
+                        reviewer.instructions
+                        + "\n\nOutput-format contract: return exactly one JSON object with all "
+                        + "these required keys: status, lesson, source_conversation_type, trigger, "
+                        + "instruction, evidence_refs, confidence, duplicate_or_novel, "
+                        + "policy_conflicts, regression_cases. status must be learning or "
+                        + "no_learning. Copy source_conversation_type exactly from the request. "
+                        + "confidence must be a number from 0 to 1, never a word. "
+                        + "duplicate_or_novel must be novel, duplicate, or not_applicable. Each "
+                        + "regression case must contain case and expected_behavior. For no_learning, "
+                        + "set lesson, trigger, and instruction to null, evidence_refs and "
+                        + "regression_cases to empty arrays, and duplicate_or_novel to duplicate "
+                        + "or not_applicable. Do not omit keys, add keys, wrap the object, or use "
+                        + "markdown."
+                    )
+                }
+            ],
             messages=[{"role": "user", "content": [{"text": json.dumps(request)}]}],
             inferenceConfig={"maxTokens": 2_000, "temperature": 0.0},
         )
@@ -182,12 +205,14 @@ class BedrockReviewerImprovementProposer:
         self.client = client or BedrockReviewerCaseRunner._client(settings)
         self.model_id = settings.bedrock_model_id
         self.max_output_bytes = settings.skill_update_model_output_max_bytes
+        self.min_confidence = settings.skill_update_min_confidence
 
     def propose(
         self,
         active_reviewer: Skill,
         suite: Sequence[ReviewerEvalCase],
         failed_case_ids: list[str],
+        failed_case_results: Sequence[ReviewerCaseResult] = (),
     ) -> str | None:
         payload = json.dumps(
             {
@@ -197,10 +222,17 @@ class BedrockReviewerImprovementProposer:
                     for case in suite
                     if case.case_id in failed_case_ids
                 ],
+                "failed_case_results": [
+                    result.model_dump(mode="json") for result in failed_case_results
+                ],
+                "minimum_confidence": self.min_confidence,
                 "required_metadata": {
                     "key": "skill_reviewer",
                     "intent": "skill_reviewer",
-                    "next_release": str(int(active_reviewer.header.release) + 1),
+                    "release": str(int(active_reviewer.header.release) + 1),
+                    "triggers": active_reviewer.header.triggers,
+                    "required_fields": active_reviewer.header.required_fields,
+                    "optional_fields": active_reviewer.header.optional_fields,
                 },
             },
             ensure_ascii=False,
@@ -212,8 +244,15 @@ class BedrockReviewerImprovementProposer:
                     "text": (
                         "Make only a narrowly scoped instruction improvement supported by the "
                         "listed fixed-suite failures. Return exactly a complete skill_reviewer.md "
-                        "file with valid front matter, or the exact token NO_CHANGE. Preserve all "
-                        "unrelated instructions. Do not include analysis or personal data."
+                        "file with this exact front matter schema: key, release, intent, triggers, "
+                        "required_fields, optional_fields. Use the required_metadata values exactly; "
+                        "never use next_release. Preserve the active_reviewer body verbatim as the "
+                        "beginning of the proposed body, then append only the narrow improvement. "
+                        "When failures are caused by confidence below minimum_confidence, improve "
+                        "confidence calibration using evidence quality; never instruct the reviewer "
+                        "to inflate confidence or merely cross the threshold. "
+                        "Alternatively return the exact token NO_CHANGE. Do not include analysis or "
+                        "personal data."
                     )
                 }
             ],
@@ -350,7 +389,14 @@ class ReviewerUpdateLane:
                 else:
                     try:
                         baseline = self._evaluate(active)
-                    except Exception:
+                    except Exception as exc:
+                        logger.error(
+                            "reviewer_baseline_evaluation_exception run_id=%s "
+                            "error_type=%s error=%s",
+                            run_id,
+                            type(exc).__name__,
+                            str(exc)[:500],
+                        )
                         return self._fail_run(run_id, "reviewer_baseline_evaluation_failed")
                     failed_ids = [case.case_id for case in baseline.cases if not case.passed]
                     with self.session_factory.begin() as session:
@@ -369,13 +415,31 @@ class ReviewerUpdateLane:
                         return self._set_no_change(run_id, "active_reviewer_passes_fixed_suite")
                     try:
                         proposed_text = self.proposer.propose(
-                            active, REVIEWER_EVAL_SUITE, failed_ids
+                            active,
+                            REVIEWER_EVAL_SUITE,
+                            failed_ids,
+                            [case for case in baseline.cases if not case.passed],
                         )
-                    except Exception:
+                    except Exception as exc:
+                        logger.error(
+                            "reviewer_improvement_proposal_exception run_id=%s "
+                            "error_type=%s error=%s",
+                            run_id,
+                            type(exc).__name__,
+                            str(exc)[:500],
+                        )
                         return self._fail_run(run_id, "reviewer_improvement_proposal_failed")
                     if proposed_text is None:
                         return self._set_no_change(run_id, "no_supported_improvement_proposed")
-                    proposed_text = proposed_text.rstrip() + "\n"
+                    try:
+                        proposed_text = self._normalize_proposed_skill(proposed_text, active)
+                    except ValueError as exc:
+                        logger.error(
+                            "reviewer_proposal_normalization_failed run_id=%s reason=%s",
+                            run_id,
+                            str(exc),
+                        )
+                        return self._fail_run(run_id, "reviewer_proposal_metadata_invalid")
                     candidate = parse_skill_text(proposed_text, "skill_reviewer.md")
                     try:
                         release_is_newer = int(candidate.header.release) > int(
@@ -411,7 +475,14 @@ class ReviewerUpdateLane:
 
                 try:
                     proposed = self._evaluate(candidate)
-                except Exception:
+                except Exception as exc:
+                    logger.error(
+                        "reviewer_candidate_evaluation_exception run_id=%s "
+                        "error_type=%s error=%s",
+                        run_id,
+                        type(exc).__name__,
+                        str(exc)[:500],
+                    )
                     return self._fail_run(run_id, "reviewer_candidate_evaluation_failed")
                 improvement = sum(
                     candidate_result.passed and not baseline_result.passed
@@ -441,9 +512,39 @@ class ReviewerUpdateLane:
         results: list[ReviewerCaseResult] = []
         if len(REVIEWER_EVAL_SUITE) != 3 or SUITE_VERSION != "reviewer-fixed-v1":
             raise RuntimeError("reviewer_fixed_suite_unavailable")
+        audit_path = self.skill_directory / "skill_reviewer_auditor.md"
+        if not audit_path.is_file():
+            audit_path = Path(__file__).resolve().parents[2] / "skills" / "skill_reviewer_auditor.md"
+        if audit_path.is_symlink() or not audit_path.is_file():
+            raise RuntimeError("fixed_reviewer_auditor_skill_missing")
+        audit_skill = parse_skill_text(audit_path.read_text(encoding="utf-8"), audit_path.name)
+        audited_reviewer = Skill(
+            header=reviewer.header,
+            instructions=f"{reviewer.instructions}\n\n{audit_skill.instructions}",
+        )
         for case in REVIEWER_EVAL_SUITE:
-            raw = self.runner.run(reviewer, case)
-            output = LearningReviewOutput.model_validate(raw)
+            try:
+                raw = self.runner.run(audited_reviewer, case)
+                output = LearningReviewOutput.model_validate(raw)
+            except ValidationError as exc:
+                logger.error(
+                    "reviewer_evaluation_case_schema_failed case_id=%s error=%s",
+                    case.case_id,
+                    str(exc)[:500],
+                )
+                results.append(
+                    ReviewerCaseResult(
+                        case_id=case.case_id,
+                        schema_compliant=False,
+                        evidence_accurate=False,
+                        policy_safe=False,
+                        expected_behavior_met=False,
+                        confidence=None,
+                        confidence_adequate=False,
+                        passed=False,
+                    )
+                )
+                continue
             supported_refs = set(case.snapshot["evidence_refs"])
             evidence_accurate = set(output.evidence_refs) <= supported_refs
             output_text = " ".join(
@@ -459,7 +560,15 @@ class ReviewerUpdateLane:
                 and output.source_conversation_type == case.source_type
                 and (not case.expected_policy_conflict or bool(output.policy_conflicts))
             )
-            passed = evidence_accurate and policy_safe and expected
+            confidence_adequate = output.confidence >= self.settings.skill_update_min_confidence
+            passed = evidence_accurate and policy_safe and expected and confidence_adequate
+            if not confidence_adequate:
+                logger.info(
+                    "reviewer_confidence_below_threshold case_id=%s confidence=%.3f threshold=%.3f",
+                    case.case_id,
+                    output.confidence,
+                    self.settings.skill_update_min_confidence,
+                )
             results.append(
                 ReviewerCaseResult(
                     case_id=case.case_id,
@@ -467,6 +576,8 @@ class ReviewerUpdateLane:
                     evidence_accurate=evidence_accurate,
                     policy_safe=policy_safe,
                     expected_behavior_met=expected,
+                    confidence=output.confidence,
+                    confidence_adequate=confidence_adequate,
                     passed=passed,
                 )
             )
@@ -591,6 +702,35 @@ class ReviewerUpdateLane:
         if end < 0:
             raise ArtifactIntegrityError("reviewer candidate proposed skill fence is incomplete")
         return content[start:end].rstrip() + "\n"
+
+    @staticmethod
+    def _normalize_proposed_skill(proposed_text: str, active: Skill) -> str:
+        """Use model output for the body, but keep required metadata deterministic."""
+        match = re.match(
+            r"\A---\s*\n.*?\n---\s*\n(?P<body>.*)\Z", proposed_text.strip(), re.S
+        )
+        if match is None:
+            raise ValueError("reviewer_proposal_missing_front_matter")
+        body = match.group("body").strip()
+        if not body.startswith(active.instructions):
+            raise ValueError("reviewer_proposal_did_not_preserve_active_instructions")
+        header = active.header
+        release = int(header.release) + 1
+
+        def yaml_list(items: list[str]) -> str:
+            return "[" + ", ".join(json.dumps(item, ensure_ascii=False) for item in items) + "]"
+
+        return (
+            "---\n"
+            "key: skill_reviewer\n"
+            f"release: {release}\n"
+            "intent: skill_reviewer\n"
+            f"triggers: {yaml_list(header.triggers)}\n"
+            f"required_fields: {yaml_list(header.required_fields)}\n"
+            f"optional_fields: {yaml_list(header.optional_fields)}\n"
+            "---\n"
+            f"{body}\n"
+        )
 
     def _persist_evaluation(
         self,
@@ -869,12 +1009,15 @@ class ReviewerUpdateLane:
         return {"run_id": str(run_id), "status": "failed", "reason_code": reason}
 
     @staticmethod
-    def _metrics(result: ReviewerEvaluationResult) -> dict[str, int]:
+    def _metrics(result: ReviewerEvaluationResult) -> dict[str, Any]:
+        confidences = [case.confidence for case in result.cases if case.confidence is not None]
         return {
             "passed_cases": sum(case.passed for case in result.cases),
             "schema_compliant_cases": sum(case.schema_compliant for case in result.cases),
             "evidence_accurate_cases": sum(case.evidence_accurate for case in result.cases),
             "policy_safe_cases": sum(case.policy_safe for case in result.cases),
+            "confidence_adequate_cases": sum(case.confidence_adequate for case in result.cases),
+            "average_confidence": (sum(confidences) / len(confidences)) if confidences else None,
         }
 
     @staticmethod

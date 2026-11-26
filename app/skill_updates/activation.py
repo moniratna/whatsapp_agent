@@ -1140,6 +1140,8 @@ class SkillActivationService:
         try:
             reviewer_path = self.skill_directory / ACTIVE_SKILL_MANIFEST["skill_reviewer"]
             reviewer_hash = hashlib.sha256(reviewer_path.read_bytes()).hexdigest()
+            reviewer_run_id: uuid.UUID | None = None
+            created = False
             with self.session_factory.begin() as session:
                 batch = session.get(SkillConsolidationBatch, batch_id)
                 update = session.scalar(
@@ -1157,15 +1159,23 @@ class SkillActivationService:
                     select(ReviewerUpdateRun).where(ReviewerUpdateRun.customer_batch_id == batch_id)
                 )
                 if existing is None:
-                    session.add(
-                        ReviewerUpdateRun(
-                            id=uuid.uuid4(),
-                            customer_batch_id=batch_id,
-                            status="queued",
-                            suite_version="reviewer-fixed-v1",
-                            active_reviewer_sha256=reviewer_hash,
-                        )
+                    existing = ReviewerUpdateRun(
+                        id=uuid.uuid4(),
+                        customer_batch_id=batch_id,
+                        status="queued",
+                        suite_version="reviewer-fixed-v1",
+                        active_reviewer_sha256=reviewer_hash,
                     )
+                    session.add(existing)
+                    created = True
+                reviewer_run_id = existing.id
+            _LOGGER.info(
+                "reviewer_update_run_queued batch_id=%s run_id=%s created=%s enabled=%s",
+                batch_id,
+                reviewer_run_id,
+                created,
+                self.settings.skill_reviewer_updates_enabled,
+            )
             if self.reviewer_update_enqueue is not None:
                 self.reviewer_update_enqueue(batch_id)
         except Exception:

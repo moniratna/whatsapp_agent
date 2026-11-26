@@ -275,6 +275,22 @@ class OutboundWorker:
             return None
         if conversation.state != "active_agent":
             return "conversation_not_agent_owned"
+        if message.skill_key == "inactivity_reminder" and message.agent_run_id:
+            run = session.get(AgentRun, message.agent_run_id)
+            trigger = session.get(Message, run.trigger_message_id) if run else None
+            if trigger is None:
+                return "reminder_trigger_missing"
+            newer_inbound = session.scalar(
+                select(Message.id)
+                .where(
+                    Message.conversation_id == conversation.id,
+                    Message.direction == "inbound",
+                    Message.created_at > trigger.created_at,
+                )
+                .limit(1)
+            )
+            if newer_inbound is not None:
+                return "reminder_cancelled_by_reply"
         active_handover = session.scalar(
             select(HandoverCase.id).where(
                 HandoverCase.conversation_id == conversation.id,
@@ -423,6 +439,39 @@ class OutboundWorker:
             conversation = session.get(Conversation, message.conversation_id)
             if conversation is not None:
                 conversation.last_outbound_at = now
+                if (
+                    message.sender_type == "automated_agent"
+                    and bool(
+                        event.payload_json.get("close_conversation_on_accept")
+                        if isinstance(event.payload_json, dict)
+                        else False
+                    )
+                    and conversation.state == "active_agent"
+                ):
+                    conversation.state = "closed"
+                    conversation.closed_at = now
+                    conversation.version += 1
+                    logger.info(
+                        "conversation_closed_after_agent_decision conversation_id=%s message_id=%s",
+                        conversation.id,
+                        message.id,
+                    )
+                    waiting_events = session.scalars(
+                        select(IntegrationEvent).where(
+                            IntegrationEvent.integration == "openwa",
+                            IntegrationEvent.direction == "outbound",
+                            IntegrationEvent.aggregate_id == conversation.id,
+                            IntegrationEvent.status.in_(("pending", "retry_wait")),
+                        )
+                    )
+                    for waiting_event in waiting_events:
+                        waiting_message = self._message_for_event(session, waiting_event)
+                        if waiting_message is None or waiting_message.skill_key != "inactivity_reminder":
+                            continue
+                        waiting_event.status = "cancelled"
+                        waiting_event.last_error_code = "conversation_completed"
+                        waiting_event.processed_at = now
+                        waiting_message.delivery_status = "cancelled"
             attempt.status = "accepted"
             attempt.provider_message_id = provider_message_id
             attempt.completed_at = now

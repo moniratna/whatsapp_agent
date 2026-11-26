@@ -56,7 +56,7 @@ app/
     selection.py               # eligible conversation query and stable cursor
     extraction.py              # ordered transcript snapshot + de-identification
     candidates.py              # candidate ID allocation, write/read, hash checking
-    batching.py                # claim exact batch size; leases and manifest
+    batching.py                # claim per-source batches; leases and manifest
     consolidation.py           # combine, size check, deterministic splitting
     validation.py              # format, evidence, policy, regression checks
     routing.py                 # buyer/seller/general/portfolio/unknown destination classification
@@ -349,13 +349,13 @@ Each milestone is a small, reviewable code change. A coding agent should read th
 
 **Exit criteria:** valid novel fixture output creates one de-identified candidate `.md` in the correct local source-type folder and a DB metadata row with matching hash; invalid, duplicate, weak, or conflicting outputs create no candidate; active skills remain untouched.
 
-### Milestone 6 — Exact batch claim and consolidation
+### Milestone 6 — Per-source batch claim and consolidation
 
 **Read:** transaction/locking patterns, candidate state machine, configured batch size, size policy.
 
-**Implement:** maintain separate queues for source types `buyer`, `seller`, `portfolio`, `general`, and `unknown`; atomically claim exactly 50 candidates of one source type, create an immutable ordered manifest, verify hashes, consolidate to a temporary artifact, split at rule boundaries under configurable limits, and account for every source candidate. The second review assigns final targets and may group updates to multiple active skills.
+**Implement:** maintain separate queues for source types `buyer`, `seller`, `portfolio`, `general`, and `unknown`; atomically claim up to the configured batch size of one source type, flushing an older partial batch after the configured maximum wait; create an immutable ordered manifest, verify hashes, consolidate to a temporary artifact, split at rule boundaries under configurable limits, and account for every source candidate. The second review assigns final targets and may group updates to multiple active skills.
 
-**Exit criteria:** fewer than 50 does nothing; concurrent workers cannot overlap; exactly 50 are claimed once; byte-limit splitting never breaks a rule; tampered/missing candidates fail closed and remain available for investigation.
+**Exit criteria:** candidates are never mixed across source types; newer partial batches wait up to the configured maximum; aged partial batches are claimed once; concurrent workers cannot overlap; byte-limit splitting never breaks a rule; tampered/missing candidates fail closed and remain available for investigation.
 
 ### Milestone 7 — Second review, regression validation, and merge proposal
 

@@ -7,6 +7,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Event
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -31,6 +32,12 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     if settings.run_workers_in_api and settings.app_env not in {"development", "test"}:
         raise RuntimeError("RUN_WORKERS_IN_API is restricted to local development and test")
 
+    reminder_stop = Event()
+    from app.workers.reminders import InactivityReminderWorker
+
+    reminder_worker = InactivityReminderWorker(application.state.session_factory)
+    reminder_task = asyncio.create_task(asyncio.to_thread(reminder_worker.run, reminder_stop))
+
     modules = [
         "app.workers.conversation",
         "app.workers.outbound",
@@ -54,6 +61,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 logger.info("embedded_worker_started module=%s pid=%s", module, process.pid)
         yield
     finally:
+        reminder_stop.set()
+        await reminder_task
         for process in reversed(processes):
             if process.returncode is None:
                 process.terminate()

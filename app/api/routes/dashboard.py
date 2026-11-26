@@ -2,6 +2,7 @@
 
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 import hmac
 from typing import Annotated, Any
 from uuid import UUID
@@ -11,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import DbSession
+from app.analytics.sentiment import classify_sentiment
 from app.auth.identity import AdminPrincipal, ensure_admin_user
 from app.config.settings import Settings, get_settings
 from app.db.models import (
@@ -46,6 +48,26 @@ def _audit_read(session: Session, principal: AdminPrincipal, action: str, entity
     session.add(AuditEvent(actor_type="admin", actor_id=principal.subject_id,
         action=action, entity_type=entity_type, entity_id=entity_id))
     session.commit()
+
+
+def _backfill_message_sentiment(session: Session) -> None:
+    """Annotate legacy inbound messages so sentiment charts include older conversations."""
+    messages = list(
+        session.scalars(
+            select(Message)
+            .where(
+                Message.direction == "inbound",
+                Message.sender_type == "customer",
+                Message.sentiment.is_(None),
+            )
+            .order_by(Message.created_at, Message.id)
+            .limit(5000)
+        )
+    )
+    for message in messages:
+        sentiment, confidence = classify_sentiment(message.body_text or "")
+        message.sentiment = sentiment
+        message.sentiment_confidence = Decimal(str(confidence))
 
 
 def _customer(session: Session, contact: Contact) -> dict[str, Any]:
@@ -88,7 +110,27 @@ def _customer(session: Session, contact: Contact) -> dict[str, Any]:
     locations = [item for item in locations if item]
     phone = contact.phone_e164
     name = contact.display_name or phone
-    intent = ("Buy property" if requirement.transaction_type == "buy" else "Sell property") if requirement else "Unknown"
+    purpose_text = (requirement.purpose or "").casefold() if requirement else ""
+    investment_purpose = any(
+        term in purpose_text for term in ("invest", "rental yield", "capital growth", "yield")
+    )
+    if requirement is None:
+        intent = "Unknown"
+    elif requirement.transaction_type == "rent":
+        intent = "Rent property"
+    elif requirement.transaction_type == "buy" and investment_purpose:
+        intent = "Investment"
+    elif requirement.transaction_type == "buy":
+        intent = "Buy property"
+    else:
+        intent = "Sell property"
+    size = "Not specified"
+    if requirement and (requirement.size_min is not None or requirement.size_max is not None):
+        low = requirement.size_min if requirement.size_min is not None else requirement.size_max
+        high = requirement.size_max if requirement.size_max is not None else requirement.size_min
+        unit = f" {requirement.size_unit}" if requirement.size_unit else ""
+        size = f"{low:,.0f}" if low == high else f"{low:,.0f}–{high:,.0f}"
+        size += unit
     crm_statuses = [link.sync_status for link in crm_links]
     crm = "Synced" if "synced" in crm_statuses else ("Failed" if "failed" in crm_statuses else "Pending")
     result: dict[str, Any] = {
@@ -102,7 +144,14 @@ def _customer(session: Session, contact: Contact) -> dict[str, Any]:
         "lastActive": conversation.updated_at.isoformat() if conversation else None,
         "joined": contact.created_at.isoformat() if contact.created_at else None,
         "propertyType": requirement.property_type if requirement and requirement.property_type else "Not specified",
-        "bedrooms": (str(requirement.bedrooms_min) if requirement and requirement.bedrooms_min is not None else "Not specified"),
+        "size": size,
+        "bedrooms": (
+            "Not applicable"
+            if requirement and requirement.property_type and any(
+                term in requirement.property_type.casefold() for term in ("plot", "land")
+            )
+            else (str(requirement.bedrooms_min) if requirement and requirement.bedrooms_min is not None else "Not specified")
+        ),
         "purpose": requirement.purpose if requirement and requirement.purpose else "Not specified",
         "timeline": requirement.timing_text if requirement and requirement.timing_text else "Not specified",
         "payment": "Not specified", "tags": [requirement.match_readiness] if requirement else [],
@@ -136,6 +185,7 @@ def _customer(session: Session, contact: Contact) -> dict[str, Any]:
 def customers(session: DbSession, principal: ReadAdmin,
               q: str | None = None, intent: str | None = None,
               skip: int = Query(default=0, ge=0), limit: int = Query(default=25, ge=1, le=100)) -> dict[str, Any]:
+    _backfill_message_sentiment(session)
     query = select(Contact).where(Contact.retention_state == "active")
     contacts = list(session.scalars(query.order_by(Contact.updated_at.desc())))
     rows = [_customer(session, contact) for contact in contacts]
@@ -143,9 +193,9 @@ def customers(session: DbSession, principal: ReadAdmin,
         search = q.casefold()
         rows = [row for row in rows if any(search in row[field].casefold() for field in ("name", "phone", "location"))]
     if intent and intent.lower() not in {"all", "unknown"}:
-        aliases = {"buy property": "buy", "investment": "buy", "rent property": "rent", "sell property": "sell"}
+        aliases = {"buy property": "buy", "investment": "investment", "rent property": "rent", "sell property": "sell"}
         selected_intent = aliases.get(intent.lower(), intent.lower())
-        rows = [row for row in rows if row["intent"].lower() == selected_intent]
+        rows = [row for row in rows if aliases.get(row["intent"].lower(), row["intent"].lower()) == selected_intent]
     result = {"items": rows[skip:skip + limit], "total": len(rows), "skip": skip, "limit": limit}
     _audit_read(session, principal, "dashboard.customer_list_read", "customer_directory", "all")
     return result
@@ -153,6 +203,7 @@ def customers(session: DbSession, principal: ReadAdmin,
 
 @router.get("/customers/{contact_id}")
 def customer(contact_id: UUID, session: DbSession, principal: ReadAdmin) -> dict[str, Any]:
+    _backfill_message_sentiment(session)
     contact = session.get(Contact, contact_id)
     if contact is None:
         raise HTTPException(status_code=404, detail="customer not found")
@@ -164,6 +215,7 @@ def customer(contact_id: UUID, session: DbSession, principal: ReadAdmin) -> dict
 @router.get("/summary")
 def summary(session: DbSession, principal: ReadAdmin,
             days: int = Query(default=30, ge=1, le=365)) -> dict[str, Any]:
+    _backfill_message_sentiment(session)
     contacts = list(session.scalars(select(Contact).where(Contact.retention_state == "active")))
     total = len(contacts)
     since = datetime.now(UTC) - timedelta(days=days)
@@ -198,6 +250,7 @@ def summary(session: DbSession, principal: ReadAdmin,
 @router.get("/reports")
 def reports(session: DbSession, principal: ReadAdmin,
             days: int = Query(default=30, ge=1, le=365)) -> dict[str, Any]:
+    _backfill_message_sentiment(session)
     contacts = list(session.scalars(select(Contact).where(Contact.retention_state == "active")))
     by_day = Counter(c.created_at.date().isoformat() for c in contacts if c.created_at)
     requirements = list(session.scalars(select(PropertyRequirement).where(PropertyRequirement.status == "active")))
@@ -222,7 +275,8 @@ def reports(session: DbSession, principal: ReadAdmin,
         for index in range(5) if confidence_values
     ]
     total = max(1, sum(intent.values()))
-    breakdown = lambda counts: [{"label": key, "count": count, "percentage": round(count * 100 / total)} for key, count in counts.items()]
+    intent_labels = {"buy": "Buy property", "rent": "Rent property", "sell": "Sell property"}
+    breakdown = lambda counts: [{"label": intent_labels.get(key, key), "count": count, "percentage": round(count * 100 / total)} for key, count in counts.items()]
     result = {"customerGrowth": [{"label": key, "count": value} for key, value in sorted(by_day.items())[-days:]],
             "intentDistribution": breakdown(intent), "sentimentDistribution": sentiment_distribution,
             "investmentPurpose": breakdown(Counter(r.purpose for r in requirements if r.purpose)),

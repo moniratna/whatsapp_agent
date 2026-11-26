@@ -32,7 +32,7 @@ from app.db.models import (
     PropertyRequirement,
     RuntimeControl,
 )
-from app.integrations.bedrock.provider import LlmPort
+from app.integrations.bedrock.provider import LlmPort, is_rental_transaction_intent
 from app.skills.loader import load_skills, select_skill
 
 logger = logging.getLogger("whatsapp_assistant.conversation_worker")
@@ -54,8 +54,11 @@ def _requirement_missing_core_fields(requirement: PropertyRequirement) -> list[s
     if not requirement.property_type:
         missing.append("property type")
     bedroom_preferences = requirement.preferences or {}
+    property_type = (requirement.property_type or "").casefold()
+    bedroom_required = not any(term in property_type for term in ("plot", "land"))
     if (
-        requirement.bedrooms_min is None
+        bedroom_required
+        and requirement.bedrooms_min is None
         and requirement.bedrooms_max is None
         and not any(
             key in bedroom_preferences
@@ -81,32 +84,44 @@ def _extract_explicit_budget(text: str) -> dict[str, str]:
     """Parse a clear numeric budget from common customer wording."""
     marker = re.search(r"\b(?:budget|price range|spend)\b", text, re.IGNORECASE)
     segment = text[marker.end() :] if marker else text
-    segment = re.split(r"[;\n.!?]", segment, maxsplit=1)[0]
+    segment = re.split(r"[;\n!?]|(?<!\d)\.(?!\d)", segment, maxsplit=1)[0]
     number = r"\d[\d,]*(?:\.\d+)?"
-    unit = r"crores?|cr|lakhs?|lacs?|lac|l|millions?|mn|thousands?|k"
+    unit = r"crores?|cr|lakhs?|lacs?|lac|l|millions?|mn|m|thousands?|k"
     range_match = re.search(
-        rf"({number})\s*(?:-|to)\s*({number})\s*({unit})\b",
+        rf"({number})\s*({unit})?\s*(?:-|to)\s*({number})\s*({unit})?\b",
         segment,
         re.IGNORECASE,
     )
     if range_match:
         low, high = Decimal(range_match.group(1).replace(",", "")), Decimal(
-            range_match.group(2).replace(",", "")
+            range_match.group(3).replace(",", "")
         )
-        suffix = range_match.group(3).casefold()
+        suffix = (range_match.group(4) or range_match.group(2) or "").casefold()
+        if not suffix and not re.search(
+            r"(?:₹|\b(?:INR|USD|EUR|GBP|AED|CAD|AUD)\b)", segment, re.IGNORECASE
+        ):
+            return {}
         multiplier = (
             Decimal(100_000)
             if suffix.startswith(("lakh", "lac")) or suffix == "l"
             else Decimal(10_000_000)
             if suffix.startswith(("crore", "cr"))
             else Decimal(1_000_000)
-            if suffix.startswith(("million", "mn"))
+            if suffix.startswith(("million", "mn")) or suffix == "m"
             else Decimal(1_000)
         )
-        return {
+        result = {
             "budget_min": str(low * multiplier),
             "budget_max": str(high * multiplier),
         }
+        currency_match = re.search(
+            r"\b(INR|USD|EUR|GBP|AED|CAD|AUD)\b", segment, re.IGNORECASE
+        )
+        if currency_match:
+            result["currency"] = currency_match.group(1).upper()
+        elif "₹" in segment:
+            result["currency"] = "INR"
+        return result
     amount_match = re.search(rf"({number})\s*({unit})\b", segment, re.IGNORECASE)
     if amount_match:
         amount = Decimal(amount_match.group(1).replace(",", ""))
@@ -117,21 +132,175 @@ def _extract_explicit_budget(text: str) -> dict[str, str]:
             else Decimal(10_000_000)
             if suffix.startswith(("crore", "cr"))
             else Decimal(1_000_000)
-            if suffix.startswith(("million", "mn"))
+            if suffix.startswith(("million", "mn")) or suffix == "m"
             else Decimal(1_000)
         )
-        return {"budget_max": str(amount * multiplier)}
+        result = {"budget_max": str(amount * multiplier)}
+        currency_match = re.search(
+            r"\b(INR|USD|EUR|GBP|AED|CAD|AUD)\b", segment, re.IGNORECASE
+        )
+        if currency_match:
+            result["currency"] = currency_match.group(1).upper()
+        return result
     # A plain number is safe only when the customer also gave an explicit currency.
     if re.search(r"(?:₹|\b(?:INR|USD|EUR|GBP|AED|CAD|AUD)\b)", segment, re.IGNORECASE):
         amount_match = re.search(number, segment)
         if amount_match:
             amount = Decimal(amount_match.group().replace(",", ""))
-            return {"budget_max": str(amount)}
+            currency_match = re.search(
+                r"\b(INR|USD|EUR|GBP|AED|CAD|AUD)\b", segment, re.IGNORECASE
+            )
+            result = {"budget_max": str(amount)}
+            if currency_match:
+                result["currency"] = currency_match.group(1).upper()
+            return result
     return {}
 
 
+def _transcript_requirement_facts(
+    transcript: list[dict[str, str]], *, portfolio: bool = False
+) -> list[tuple[str, str, Any, str | None, str]]:
+    """Recover explicit answers tied to the agent's preceding intake question."""
+    recovered: list[tuple[str, str, Any, str | None, str]] = []
+    locations: list[str] = []
+    turns = transcript[-40:]
+    for index in range(1, len(turns)):
+        question = turns[index - 1]
+        answer = turns[index]
+        if question.get("role") != "assistant" or answer.get("role") != "user":
+            continue
+        prompt = (question.get("text") or "").casefold()
+        text = (answer.get("text") or "").strip()
+        normalized = text.casefold().strip(" .,!?")
+        if not text or normalized in {"hi", "hello", "hey", "okay sure", "ok sure"}:
+            continue
+        message_id = answer.get("message_id")
+        entity_type = "portfolio_asset" if portfolio else "requirement"
+
+        def add(field: str, value: Any, *, kind: str = entity_type) -> None:
+            recovered.append((kind, field, value, message_id, text))
+
+        if any(
+            phrase in normalized
+            for phrase in ("nothing right now", "nothing else", "i am done", "i'm done", "that's all", "no more questions")
+        ):
+            if portfolio:
+                add("portfolio_notes", "No additional property details shared.")
+            else:
+                add("preferences", {"additional_preferences": "none"})
+            continue
+
+        if any(term in prompt for term in ("when would", "when do you", "timeline", "move in", "complete the purchase", "complete your purchase")):
+            if portfolio:
+                add("portfolio_notes", text)
+            else:
+                add("timing_text", text, kind="requirement")
+            continue
+
+        if any(term in prompt for term in ("budget", "price range", "how much", "investment amount")):
+            budget = _extract_explicit_budget(text)
+            if portfolio:
+                amount = budget.get("value", budget.get("budget_max"))
+                if amount is not None:
+                    add("value", amount)
+                currency = budget.get("value_currency", budget.get("currency"))
+                if currency:
+                    add("value_currency", currency)
+            else:
+                for field in ("budget_min", "budget_max", "currency"):
+                    if field in budget:
+                        add(field, budget[field])
+                if "currency" not in budget and (
+                    "budget_min" in budget or "budget_max" in budget
+                ):
+                    inferred = _infer_location_currency(locations)
+                    if inferred:
+                        add("currency", inferred)
+            continue
+
+        if any(term in prompt for term in ("size", "square feet", "square foot", "acreage", "area range")):
+            size = re.search(
+                r"(?P<amount>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>sq\.?\s*ft\.?|square\s+feet|square\s+foot|sq\.?\s*m|square\s+met(?:er|re)s?|acres?|hectares?)\b",
+                text,
+                re.IGNORECASE,
+            )
+            if size:
+                amount = size.group("amount").replace(",", "")
+                unit = size.group("unit").casefold()
+                normalized_unit = (
+                    "acre" if unit.startswith("acre") else
+                    "ha" if unit.startswith("hectare") else
+                    "sq m" if "square met" in unit or "sq m" in unit else "sq ft"
+                )
+                if portfolio:
+                    add("size", amount)
+                    add("size_unit", normalized_unit)
+                else:
+                    add("size_min", amount)
+                    add("size_max", amount)
+                    add("size_unit", normalized_unit)
+            continue
+
+        if any(term in prompt for term in ("area or neighbourhood", "area or neighborhood", "preferred area", "which area", "location")):
+            if portfolio:
+                add("location", text.removeprefix("For ").strip())
+            else:
+                location = text.removeprefix("For ").strip()
+                locations.append(location)
+                add("locations", [location])
+            continue
+
+        if any(term in prompt for term in ("own use", "investment, or another purpose", "primary objective", "what is the purpose", "own business use", "purpose for")):
+            if portfolio:
+                add("ownership_status", text)
+            else:
+                add("purpose", text, kind="requirement")
+            continue
+
+        if any(term in prompt for term in ("type of property", "type of commercial space", "what kind of property", "which property type")):
+            add("property_type", text.removeprefix("For ").strip())
+            continue
+
+        if any(term in prompt for term in ("amenit", "preference", "priorit", "what else would you like me to know")):
+            if portfolio:
+                add("portfolio_notes", text)
+            elif not any(word in normalized for word in ("nothing", "none", "no preference")):
+                add("preferences", {"practical_priorities": text})
+
+    return recovered
+
+
+def _transcript_transaction_type(transcript: list[dict[str, str]]) -> str | None:
+    for turn in reversed(transcript[-40:]):
+        if turn.get("role") != "user":
+            continue
+        text = (turn.get("text") or "").casefold()
+        if re.search(r"\b(rent|rental|lease|leasing|tenant)\b", text):
+            return "rent"
+        if re.search(r"\b(sell|selling|sale|seller)\b", text):
+            return "sell"
+        if re.search(r"\b(buy|buying|purchase|purchasing|invest|investment)\b", text):
+            return "buy"
+    return None
+
+
+def _infer_location_currency(locations: list[str]) -> str | None:
+    normalized = " ".join(locations).casefold()
+    india_markers = (
+        "india", "goa", "mumbai", "delhi", "surat", "gandhinagar", "ahmedabad",
+        "bengaluru", "bangalore", "chennai", "hyderabad", "pune", "kolkata",
+        "jaipur", "lucknow", "noida", "gurugram", "gurgaon",
+    )
+    uae_markers = ("uae", "united arab emirates", "dubai", "abu dhabi", "sharjah", "ajman")
+    if any(marker in normalized for marker in india_markers):
+        return "INR"
+    if any(marker in normalized for marker in uae_markers):
+        return "AED"
+    return None
+
+
 def _is_contextual_reply(text: str, previous_assistant_message: str = "") -> bool:
-    """Keep direct answers in context while routing unknown questions to review."""
+    """Keep short answers linked to the assistant's most recent question."""
     normalized = text.casefold().strip()
     words = re.findall(r"[a-z0-9']+", normalized)
     if not words or "?" in normalized:
@@ -295,14 +464,16 @@ class ConversationWorker:
                 inbound_text, previous_assistant_message
             )
             if skill.header.key != "unknown":
-                if active_transaction == "buy":
+                if active_transaction in {"buy", "rent"}:
                     skill = skills["buyer"]
                 elif active_transaction == "sell":
                     skill = skills["seller"]
+            elif active_transaction in {"buy", "rent"} and not _is_unverified_claim_request(inbound_text):
+                skill = skills["buyer"]
+            elif active_transaction == "sell" and not _is_unverified_claim_request(inbound_text):
+                skill = skills["seller"]
             elif contextual_reply:
-                # Direct answers continue the brief, but unknown questions
-                # stay on the handover path even during an active buying/selling chat.
-                if active_transaction == "buy":
+                if active_transaction in {"buy", "rent"}:
                     skill = skills["buyer"]
                 elif active_transaction == "sell":
                     skill = skills["seller"]
@@ -342,6 +513,8 @@ class ConversationWorker:
                     "thanks, i have the key details",
                 )
             )
+            from app.integrations.bedrock.provider import AssistantDecision
+
             if (
                 (
                     active_requirement_context
@@ -350,8 +523,6 @@ class ConversationWorker:
                 )
                 and is_acknowledgement
             ):
-                from app.integrations.bedrock.provider import AssistantDecision
-
                 decision = AssistantDecision(
                     decision="answer",
                     response_text=(
@@ -372,22 +543,30 @@ class ConversationWorker:
                 )
             from app.integrations.bedrock.provider import AssistantDecision
 
-            if skill.header.key == "unknown" and decision.decision != "handover":
-                decision = decision.model_copy(update={
-                    "decision": "handover",
-                    "response_text": "",
-                    "handover_reason": "unknown_question",
-                    "intent": "unknown",
-                    "confidence": min(decision.confidence, 0.2),
-                    "proposed_facts": [],
-                })
-            expected_intent = {"buyer": "buy", "seller": "sell"}.get(skill.header.intent)
-            if (
-                isinstance(decision, AssistantDecision)
-                and expected_intent is not None
-                and decision.intent not in {expected_intent, "mixed"}
-            ):
-                decision = decision.model_copy(update={"intent": expected_intent})
+            if isinstance(decision, AssistantDecision):
+                expected_intents = {
+                    "buyer": {"buy", "rent"},
+                    "seller": {"sell"},
+                }.get(skill.header.intent, set())
+                if expected_intents:
+                    user_texts = [
+                        turn.get("text", "").casefold()
+                        for turn in transcript
+                        if turn.get("role") == "user"
+                    ]
+                    rent_context = active_transaction == "rent" or any(
+                        is_rental_transaction_intent(text)
+                        for text in [*user_texts, inbound_text.casefold()]
+                    )
+                    preferred_intent = (
+                        "rent"
+                        if skill.header.intent == "buyer" and rent_context
+                        else active_transaction
+                        if active_transaction in expected_intents
+                        else "buy" if skill.header.intent == "buyer" else "sell"
+                    )
+                    if decision.intent != preferred_intent:
+                        decision = decision.model_copy(update={"intent": preferred_intent})
             elapsed_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
             logger.info(
                 "conversation_model_completed event_id=%s skill=%s decision=%s "
@@ -548,6 +727,7 @@ class ConversationWorker:
                 {
                     "role": "assistant" if item.direction == "outbound" else "user",
                     "text": item.body_text or f"[{item.message_type} message]",
+                    "message_id": str(item.id),
                 }
                 for item in messages
             ]
@@ -726,7 +906,7 @@ class ConversationWorker:
                     event.status,
                 )
                 return
-            if decision.intent in {"buy", "sell", "portfolio", "general", "mixed"}:
+            if decision.intent in {"buy", "rent", "sell", "portfolio", "general", "mixed"}:
                 locked_conversation.active_intent = decision.intent
             active_handover = session.scalar(
                 select(HandoverCase.id).where(
@@ -783,6 +963,8 @@ class ConversationWorker:
                 message,
                 decision,
                 now,
+                transcript=transcript,
+                skill_key=skill_key,
             )
             active_requirement = session.scalar(
                 select(PropertyRequirement)
@@ -799,14 +981,15 @@ class ConversationWorker:
                 .limit(1)
                 .with_for_update()
             )
-            if (
-                active_requirement is not None
-                and not _requirement_missing_core_fields(active_requirement)
-            ):
+            missing_core_fields = (
+                _requirement_missing_core_fields(active_requirement)
+                if active_requirement is not None
+                else []
+            )
+            if active_requirement is not None and not missing_core_fields:
                 active_requirement.match_readiness = "ready"
             if (
                 decision.decision == "handover"
-                or decision.confidence < 0.65
                 or locked_contact.consent_status == "opted_out"
                 or fact_conflict
             ):
@@ -896,6 +1079,12 @@ class ConversationWorker:
                     )
                     eligible = allow is not None
                 if eligible and locked_conversation.state == "active_agent":
+                    close_after_send = bool(
+                        decision.close_conversation
+                        and decision.decision == "answer"
+                        and locked_contact.consent_status != "opted_out"
+                        and not fact_conflict
+                    )
                     response, _ = enqueue_outbound_message(
                         session,
                         conversation_id=locked_conversation.id,
@@ -911,18 +1100,20 @@ class ConversationWorker:
                         skill_key=skill_key,
                         application_release=self.settings.app_release,
                         interactive_payload=interactive_payload,
+                        close_conversation_on_accept=close_after_send,
                     )
                     run.response_message_id = response.id
                     run.status = "completed"
                     run.decision_type = "answer"
                     logger.info(
                         "conversation_reply_enqueued event_id=%s run_id=%s message_id=%s "
-                        "conversation_id=%s mode=%s",
+                        "conversation_id=%s mode=%s close_after_send=%s",
                         event_id,
                         run.id,
                         response.id,
                         locked_conversation.id,
                         mode,
+                        close_after_send,
                     )
                     if interactive_payload is not None:
                         logger.info(
@@ -971,6 +1162,9 @@ class ConversationWorker:
         message: Message,
         decision: object,
         now: datetime,
+        *,
+        transcript: list[dict[str, str]] | None = None,
+        skill_key: str | None = None,
     ) -> bool:
         from app.integrations.bedrock.provider import AssistantDecision, ProposedFact
 
@@ -999,6 +1193,41 @@ class ConversationWorker:
                 )
                 for field_key, value in explicit_budget.items()
             )
+        proposed_with_sources: list[tuple[ProposedFact, uuid.UUID]] = [
+            (fact, message.id) for fact in proposed_facts
+        ]
+        recovered_facts = _transcript_requirement_facts(
+            transcript or [],
+            portfolio=(skill_key == "portfolio" or decision.intent == "portfolio"),
+        )
+        for entity_type, field_key, value, source_message_id, original_text in recovered_facts:
+            try:
+                proposed = ProposedFact(
+                    entity_type=entity_type,
+                    field_key=field_key,
+                    value=value,
+                    original_text=original_text,
+                    confidence=0.99,
+                )
+                proposed_with_sources.append(
+                    (
+                        proposed,
+                        uuid.UUID(source_message_id) if source_message_id else message.id,
+                    )
+                )
+            except (ValueError, TypeError):
+                logger.info(
+                    "conversation_transcript_fact_skipped field=%s reason=invalid_extracted_value",
+                    field_key,
+                )
+        if recovered_facts:
+            logger.info(
+                "conversation_transcript_facts_recovered conversation_id=%s count=%s "
+                "fields=%s",
+                conversation.id,
+                len(recovered_facts),
+                sorted({fact[1] for fact in recovered_facts}),
+            )
         active_transaction = session.scalar(
             select(PropertyRequirement.transaction_type)
             .where(
@@ -1015,7 +1244,9 @@ class ConversationWorker:
         )
         requirement: PropertyRequirement | None = None
         asset: PortfolioAsset | None = None
-        intent_map = {"buy": "buy", "sell": "sell"}
+        # Investment acquisitions are buy requirements; portfolio_asset facts still
+        # follow the separate existing-asset path below.
+        intent_map = {"buy": "buy", "rent": "rent", "sell": "sell", "portfolio": "buy"}
         allowed_fields = {
             "requirement": {
                 "property_type",
@@ -1046,7 +1277,7 @@ class ConversationWorker:
             },
         }
         conflict = False
-        for proposed in proposed_facts:
+        for proposed, source_message_id in proposed_with_sources:
             if (
                 proposed.confidence < 0.75
                 or proposed.field_key not in allowed_fields[proposed.entity_type]
@@ -1054,7 +1285,11 @@ class ConversationWorker:
                 continue
             projection: Any
             if proposed.entity_type == "requirement":
-                transaction = intent_map.get(decision.intent) or active_transaction
+                transaction = (
+                    intent_map.get(decision.intent)
+                    or active_transaction
+                    or _transcript_transaction_type(transcript or [])
+                )
                 if transaction is None:
                     continue
                 if requirement is None:
@@ -1111,6 +1346,15 @@ class ConversationWorker:
                 entity_type, entity_id, projection = "portfolio_asset", asset.id, asset
             field_key = proposed.field_key
             value = proposed.value
+            if field_key == "locations" and isinstance(value, list):
+                value = [
+                    (
+                        {"label": item, "source_text": proposed.original_text}
+                        if isinstance(item, str)
+                        else item
+                    )
+                    for item in value
+                ]
             if field_key in {"budget_min", "budget_max", "size_min", "size_max", "size", "value"}:
                 try:
                     value = Decimal(str(value))
@@ -1204,6 +1448,9 @@ class ConversationWorker:
                     else stored_value == value
                 )
                 if values_match:
+                    if current.source_message_id != source_message_id:
+                        current.source_message_id = source_message_id
+                        current.value_json = fact_value
                     continue
                 current.superseded_at = now
             if hasattr(projection, field_key):
@@ -1217,7 +1464,7 @@ class ConversationWorker:
                     value_json=fact_value,
                     confidence=Decimal(str(proposed.confidence)),
                     source_type="agent_extraction",
-                    source_message_id=message.id,
+                    source_message_id=source_message_id,
                     valid_from=now,
                 )
             )

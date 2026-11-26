@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     skill_update_lookback_days: int = Field(default=90, gt=0, le=365)
     skill_update_max_conversations_per_run: int = Field(default=500, gt=0, le=10_000)
     skill_update_batch_size: int = Field(default=50, gt=0, le=50)
+    skill_update_batch_max_wait_minutes: int = Field(default=60, gt=0, le=10_080)
     skill_update_candidate_max_bytes: int = Field(default=32_768, gt=0, le=1_048_576)
     skill_update_consolidated_max_bytes: int = Field(default=262_144, gt=0, le=4_194_304)
     skill_update_snapshot_max_bytes: int = Field(default=1_048_576, gt=0, le=10_485_760)

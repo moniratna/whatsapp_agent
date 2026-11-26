@@ -25,6 +25,7 @@ def enqueue_outbound_message(
     skill_key: str | None = None,
     application_release: str | None = None,
     interactive_payload: dict[str, Any] | None = None,
+    close_conversation_on_accept: bool = False,
 ) -> tuple[Message, bool]:
     """Persist a message and its outbox row in the caller's transaction."""
     if sender_type not in {"admin", "automated_agent"}:
@@ -48,7 +49,10 @@ def enqueue_outbound_message(
         external_event_id=idempotency_key,
         aggregate_type="conversation",
         aggregate_id=conversation_id,
-        payload_json={"message_id": str(message_id)},
+        payload_json={
+            "message_id": str(message_id),
+            "close_conversation_on_accept": close_conversation_on_accept,
+        },
         status="pending",
     )
     inserted_id = session.execute(

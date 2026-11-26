@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from app.skill_updates.storage import (
 )
 
 SOURCE_TYPES = ("buyer", "seller", "portfolio", "general", "unknown")
+logger = logging.getLogger("whatsapp_assistant.skill_update_batches")
 _CANDIDATE_BODY = re.compile(r"\A---\s*\n.*?\n---\s*\n(?P<body>.*)\Z", re.S)
 
 
@@ -96,13 +98,44 @@ class SkillBatchService:
                         SkillCandidateFile.status == "pending",
                         SkillCandidateFile.sha256.is_not(None),
                     )
-                    .order_by(SkillCandidateFile.sequence, SkillCandidateFile.id)
+                    .order_by(
+                        SkillCandidateFile.created_at,
+                        SkillCandidateFile.sequence,
+                        SkillCandidateFile.id,
+                    )
                     .limit(self.settings.skill_update_batch_size)
                     .with_for_update(skip_locked=True)
                 )
             )
-            if len(candidates) < self.settings.skill_update_batch_size:
+            if not candidates:
                 return None
+            partial_due_to_age = len(candidates) < self.settings.skill_update_batch_size
+            if partial_due_to_age:
+                oldest_created = min(self._utc(item.created_at) for item in candidates)
+                age_minutes = max(0, int((claimed_at - oldest_created).total_seconds() / 60))
+                if age_minutes < self.settings.skill_update_batch_max_wait_minutes:
+                    logger.info(
+                        "skill_update_batch_not_claimed source_type=%s pending_count=%s "
+                        "batch_size=%s age_minutes=%s max_wait_minutes=%s "
+                        "reason=insufficient_pending_candidates paths=%s",
+                        source_type,
+                        len(candidates),
+                        self.settings.skill_update_batch_size,
+                        age_minutes,
+                        self.settings.skill_update_batch_max_wait_minutes,
+                        [item.relative_path for item in candidates],
+                    )
+                    return None
+                logger.info(
+                    "skill_update_batch_partial_claim_due_to_age source_type=%s "
+                    "pending_count=%s batch_size=%s age_minutes=%s max_wait_minutes=%s",
+                    source_type,
+                    len(candidates),
+                    self.settings.skill_update_batch_size,
+                    age_minutes,
+                    self.settings.skill_update_batch_max_wait_minutes,
+                )
+            candidates.sort(key=lambda item: (item.sequence, str(item.id)))
             if any(item.sha256 is None for item in candidates):
                 raise BatchError("candidate hash is missing")
 
@@ -121,7 +154,7 @@ class SkillBatchService:
                 .values(status="claimed")
             )
             changed = getattr(update_result, "rowcount", None)
-            if changed != self.settings.skill_update_batch_size:
+            if changed != len(candidates):
                 return None
 
             stored_manifest = self._write_or_verify_manifest(batch_id, manifest_bytes, None)
@@ -141,6 +174,15 @@ class SkillBatchService:
                 lease_expires_at=claimed_at + timedelta(minutes=lease_minutes),
             )
             session.add(batch)
+            logger.info(
+                "skill_update_batch_claimed batch_id=%s source_type=%s candidate_count=%s "
+                "candidate_ids=%s paths=%s",
+                batch_id,
+                source_type,
+                len(candidates),
+                [str(item.id) for item in candidates],
+                [item.relative_path for item in candidates],
+            )
             return BatchClaim(
                 batch_id=batch_id,
                 source_type=source_type,

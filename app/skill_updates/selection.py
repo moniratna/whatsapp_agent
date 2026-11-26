@@ -11,13 +11,13 @@ from sqlalchemy.orm import Session
 from app.config.settings import Settings
 from app.db.models import Contact, Conversation, Message, PropertyRequirement, SkillUpdateRun
 
-SELECTION_POLICY_VERSION = "closed-or-active-agent-v3"
+SELECTION_POLICY_VERSION = "closed-active-or-admin-owned-v4"
 SOURCE_TYPES = frozenset({"buyer", "seller", "portfolio", "general", "unknown"})
 
 
 def source_type_for_intent(intent: str | None) -> str:
     normalized = (intent or "").strip().casefold()
-    if normalized in {"buy", "buyer"}:
+    if normalized in {"buy", "buyer", "rent", "renter"}:
         return "buyer"
     if normalized in {"sell", "seller"}:
         return "seller"
@@ -36,7 +36,7 @@ def source_type_for_intent_or_requirement(
     source_type = source_type_for_intent(intent)
     if source_type != "unknown":
         return source_type
-    source_type = {"buy": "buyer", "sell": "seller"}.get(transaction_type or "")
+    source_type = {"buy": "buyer", "rent": "buyer", "sell": "seller"}.get(transaction_type or "")
     if source_type:
         return source_type
     normalized_skill = (skill_key or "").strip().casefold()
@@ -119,7 +119,7 @@ def select_eligible_conversations(
     window_end: datetime | None = None,
     limit: int | None = None,
 ) -> SelectionPage:
-    """Select a stable, bounded page of eligible closed or active conversations.
+    """Select eligible closed, active-agent, or admin-owned conversations.
 
     The caller persists `page.to_json()` on the run and reuses the same window
     and cursor on retry. Contacts with active retention and no legal hold are
@@ -214,7 +214,7 @@ def select_eligible_conversations(
         )
         .join(Contact, Contact.id == Conversation.contact_id)
         .where(
-            Conversation.state.in_({"closed", "active_agent"}),
+            Conversation.state.in_({"closed", "active_agent", "admin_owned"}),
             selection_at >= start,
             selection_at <= end,
             Contact.retention_state == "active",

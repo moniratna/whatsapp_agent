@@ -1,5 +1,6 @@
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -7,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from app.analytics.sentiment import classify_sentiment
 from app.db.models import (
     Contact,
     Conversation,
@@ -284,6 +286,7 @@ def accept_openwa_event(session: Session, envelope: OpenWaEnvelope) -> bool:
     contact = _upsert_contact(session, normalized.provider_account_id, normalized.sender_phone_e164)
     conversation = _find_or_create_conversation(session, contact, normalized.sender_chat_id)
     timestamp = timestamp_from_milliseconds(normalized.provider_timestamp_ms)
+    sentiment, sentiment_confidence = classify_sentiment(normalized.body_text or "")
     message = Message(
         conversation_id=conversation.id,
         provider_account_id=normalized.provider_account_id,
@@ -292,6 +295,8 @@ def accept_openwa_event(session: Session, envelope: OpenWaEnvelope) -> bool:
         sender_type="customer",
         message_type=normalized.message_type,
         body_text=normalized.body_text,
+        sentiment=sentiment,
+        sentiment_confidence=Decimal(str(sentiment_confidence)),
         interactive_payload=normalized.interactive_payload,
         provider_timestamp=timestamp,
     )

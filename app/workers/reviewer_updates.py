@@ -48,8 +48,16 @@ class ReviewerUpdateWorker:
             )
         if run_id is None:
             return False
+        logger.info("reviewer_update_run_started run_id=%s", run_id)
         try:
-            self._get_lane().process(run_id)
+            result = self._get_lane().process(run_id)
+            logger.info(
+                "reviewer_update_run_finished run_id=%s status=%s candidate_id=%s reason=%s",
+                run_id,
+                result.get("status", "unknown"),
+                result.get("candidate_id", "none"),
+                result.get("reason_code", result.get("reason", "none")),
+            )
         except Exception:
             # The lane records deterministic failures itself. Unexpected transient
             # errors leave its durable state replayable by the next poll.
@@ -78,6 +86,11 @@ def run_worker() -> None:
     from app.db.connection import make_engine, make_session_factory
 
     settings = Settings()
+    logging.basicConfig(level=settings.log_level.upper(), format="%(message)s")
+    logger.info(
+        "reviewer_update_worker_started enabled=%s",
+        settings.skill_reviewer_updates_enabled,
+    )
     worker = ReviewerUpdateWorker(make_session_factory(make_engine(settings)), settings)
     while True:
         if not worker.process_one():

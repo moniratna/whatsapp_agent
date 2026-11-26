@@ -63,6 +63,7 @@ class Contact(TimestampMixin, Base):
     legal_hold: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    inactivity_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Conversation(TimestampMixin, Base):
@@ -351,7 +352,7 @@ class ClientContext(TimestampMixin, Base):
 class PropertyRequirement(TimestampMixin, Base):
     __tablename__ = "property_requirements"
     __table_args__ = (
-        CheckConstraint("transaction_type IN ('buy','sell')", name="ck_requirement_transaction"),
+        CheckConstraint("transaction_type IN ('buy','rent','sell')", name="ck_requirement_transaction"),
         CheckConstraint(
             "status IN ('active','paused','fulfilled','withdrawn','superseded')",
             name="ck_requirement_status",
@@ -810,7 +811,7 @@ class SkillCandidateFile(TimestampMixin, Base):
         ),
         CheckConstraint(
             "(candidate_type = 'customer_skill' AND source_conversation_type IS NOT NULL "
-            "AND conversation_id IS NOT NULL AND (target_skill_key IS NULL OR "
+            "AND (target_skill_key IS NULL OR "
             "target_skill_key IN ('buyer','seller','portfolio','general','unknown')) OR "
             "candidate_type = 'reviewer_skill' AND source_conversation_type IS NULL "
             "AND conversation_id IS NULL AND reviewer_release IS NOT NULL "

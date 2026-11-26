@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import Settings
-from app.db.models import SkillConsolidationBatch, SkillUpdateRun
+from app.db.models import (
+    Conversation,
+    SkillCandidateFile,
+    SkillCandidateSequence,
+    SkillConsolidationBatch,
+    SkillUpdateRun,
+)
 from app.skill_updates.activation import SkillActivationService
 from app.skill_updates.batches import SkillBatchService
 from app.skill_updates.extraction import SkillUpdateExtractor
@@ -22,7 +29,6 @@ from app.skill_updates.selection import (
     SELECTION_POLICY_VERSION,
     SelectionCursor,
     persist_selection_page,
-    persist_snapshot_metadata,
     select_eligible_conversations,
 )
 from app.skill_updates.snapshots import (
@@ -62,6 +68,7 @@ class SkillUpdateWorker:
         self.batches = batches
         self.proposals = proposals
         self.activation = activation
+        self._last_candidate_inventory_log_at: datetime | None = None
 
     def process_one(self, *, now: datetime | None = None) -> bool:
         if not self.settings.skill_updates_enabled:
@@ -247,11 +254,12 @@ class SkillUpdateWorker:
                 run.selection_json = updated
             selected = page.conversations
         logger.info(
-            "skill_update_selection_page run_id=%s selected=%s active_agent=%s closed=%s "
+            "skill_update_selection_page run_id=%s selected=%s active_agent=%s admin_owned=%s closed=%s "
             "has_more=%s window_start=%s window_end=%s",
             run_id,
             len(selected),
             sum(item.conversation_state == "active_agent" for item in selected),
+            sum(item.conversation_state == "admin_owned" for item in selected),
             sum(item.conversation_state == "closed" for item in selected),
             page.has_more,
             page.window_start.isoformat(),
@@ -276,9 +284,6 @@ class SkillUpdateWorker:
                         snapshot.snapshot_id,
                     )
                     continue
-                metadata = builder.store(snapshot, self.storage).to_json()
-                with self.session_factory.begin() as session:
-                    persist_snapshot_metadata(session, run_id, metadata)
                 result = self.extractor.process(snapshot, run_id, now=now)
                 self._record_processed_snapshot(run_id, snapshot, result)
                 logger.info(
@@ -327,6 +332,7 @@ class SkillUpdateWorker:
         if not self.settings.skill_update_consolidation_enabled:
             return False
         assert self.batches is not None
+        self._log_candidate_inventory(now)
         batch_id: uuid.UUID | None = None
         status = ""
         with self.session_factory.begin() as session:
@@ -354,6 +360,7 @@ class SkillUpdateWorker:
                 batch.lease_expires_at = now + timedelta(minutes=30)
                 batch_id, status = batch.id, batch.status
         if batch_id is None:
+            logger.debug("skill_update_batch_scan_complete result=no_eligible_batch")
             for source_type in SOURCE_TYPES:
                 claim = self.batches.claim_batch(source_type, worker_id=self.worker_id, now=now)
                 if claim is not None:
@@ -361,6 +368,12 @@ class SkillUpdateWorker:
                     break
         if batch_id is None:
             return False
+        logger.info(
+            "skill_update_batch_detected batch_id=%s status=%s action=%s",
+            batch_id,
+            status,
+            "cleanup_work_artifacts" if status == "cleaned" else "process_batch",
+        )
         if status == "cleaned":
             self._cleanup_terminal_work(batch_id)
             return True
@@ -368,19 +381,423 @@ class SkillUpdateWorker:
             if status == "claimed":
                 self.batches.consolidate(batch_id, worker_id=self.worker_id, now=now)
                 status = "consolidating"
+                logger.info(
+                    "skill_update_batch_consolidated batch_id=%s next_status=%s",
+                    batch_id,
+                    status,
+                )
             if status == "consolidating":
                 assert self.proposals is not None
                 self.proposals.prepare(batch_id, worker_id=self.worker_id, now=now)
                 status = "validating"
+                logger.info(
+                    "skill_update_batch_review_passed batch_id=%s next_status=%s",
+                    batch_id,
+                    status,
+                )
             if status in {"validating", "cleanup_pending"} and (
                 self.settings.skill_update_auto_merge_enabled
             ):
                 assert self.activation is not None
-                self.activation.process_batch(batch_id, worker_id=self.worker_id, now=now)
+                result = self.activation.process_batch(
+                    batch_id, worker_id=self.worker_id, now=now
+                )
+                logger.info(
+                    "skill_update_batch_activation_finished batch_id=%s status=%s "
+                    "active_skill_update_id=%s removed_candidate_count=%s "
+                    "removed_candidate_paths=%s",
+                    batch_id,
+                    result.get("status", "unknown"),
+                    result.get("active_skill_update_id", "none"),
+                    result.get("removed_count", 0),
+                    result.get("removed_paths", []),
+                )
                 self._cleanup_terminal_work(batch_id)
-        except Exception:
-            logger.exception("skill_update_batch_error batch_id=%s", batch_id)
+            elif status == "validating":
+                logger.info(
+                    "skill_update_batch_waiting_for_merge batch_id=%s "
+                    "reason=auto_merge_disabled",
+                    batch_id,
+                )
+        except Exception as exc:
+            logger.exception(
+                "skill_update_batch_error batch_id=%s error_type=%s error=%s",
+                batch_id,
+                type(exc).__name__,
+                exc,
+            )
         return True
+
+    def _log_candidate_inventory(self, now: datetime) -> None:
+        """Periodically report which candidate artifacts are known to the batch queue."""
+        interval = timedelta(minutes=max(1, self.settings.skill_update_schedule_minutes))
+        if (
+            self._last_candidate_inventory_log_at is not None
+            and now - self._last_candidate_inventory_log_at < interval
+        ):
+            return
+        self._last_candidate_inventory_log_at = now
+        self._recover_unregistered_candidate_files()
+        with self.session_factory() as session:
+            rows = list(
+                session.execute(
+                    select(
+                        SkillCandidateFile.source_conversation_type,
+                        SkillCandidateFile.status,
+                        func.count(SkillCandidateFile.id),
+                    )
+                    .where(
+                        SkillCandidateFile.candidate_type == "customer_skill",
+                    )
+                    .group_by(
+                        SkillCandidateFile.source_conversation_type,
+                        SkillCandidateFile.status,
+                    )
+                    .order_by(
+                        SkillCandidateFile.source_conversation_type,
+                        SkillCandidateFile.status,
+                    )
+                )
+            )
+            pending_paths = list(
+                session.scalars(
+                    select(SkillCandidateFile.relative_path)
+                    .where(
+                        SkillCandidateFile.candidate_type == "customer_skill",
+                        SkillCandidateFile.status == "pending",
+                    )
+                    .order_by(
+                        SkillCandidateFile.source_conversation_type,
+                        SkillCandidateFile.sequence,
+                    )
+                    .limit(100)
+                )
+            )
+            registered_paths = set(
+                session.scalars(
+                    select(SkillCandidateFile.relative_path).where(
+                        SkillCandidateFile.candidate_type == "customer_skill",
+                    )
+                )
+            )
+            failed_batches = list(
+                session.scalars(
+                    select(SkillConsolidationBatch)
+                    .where(SkillConsolidationBatch.status == "failed")
+                    .order_by(SkillConsolidationBatch.updated_at.desc())
+                    .limit(10)
+                )
+            )
+        db_paths = {
+            item.relative_to(self.storage.root).as_posix()
+            for item in (self.storage.root / "candidates").glob("*/*.md")
+            if item.parent.name in SOURCE_TYPES
+        } if self.storage is not None else set()
+        known_paths = set(pending_paths)
+        unregistered_paths = sorted(db_paths - known_paths)
+        logger.info(
+            "skill_update_candidate_inventory batch_size=%s database_counts=%s "
+            "pending_paths=%s physical_candidate_file_count=%s "
+            "unregistered_or_nonpending_paths=%s missing_physical_files=%s failed_batches=%s",
+            self.settings.skill_update_batch_size,
+            [
+                {"source_type": source_type, "status": status, "count": count}
+                for source_type, status, count in rows
+            ],
+            pending_paths,
+            len(db_paths),
+            unregistered_paths[:100],
+            sorted(registered_paths - db_paths)[:100],
+            [self._failed_batch_log_record(batch) for batch in failed_batches],
+        )
+
+    def _recover_unregistered_candidate_files(self) -> None:
+        """Register validated candidate files discovered in persistent storage."""
+        if self.storage is None:
+            return
+        candidates_root = self.storage.root / "candidates"
+        for source_type in SOURCE_TYPES:
+            for path in sorted(candidates_root.joinpath(source_type).glob("*_conversation_skill_*.md")):
+                match = re.fullmatch(
+                    rf"{re.escape(source_type)}_conversation_skill_(\d+)\.md", path.name
+                )
+                if match is None:
+                    continue
+                sequence = int(match.group(1))
+                try:
+                    artifact = self.storage.reconcile_candidate(source_type, sequence, None)
+                    if artifact is None:
+                        continue
+                    content = self.storage.read_candidate(artifact)
+                    metadata = self._candidate_front_matter(content)
+                    candidate_id = uuid.UUID(metadata["candidate_id"])
+                    run_id = uuid.UUID(metadata["source_run_id"])
+                    if (
+                        metadata.get("candidate_type") != "customer_skill"
+                        or metadata.get("source_conversation_type") != source_type
+                        or metadata.get("content_fingerprint") is None
+                        or not metadata.get("evidence_refs")
+                    ):
+                        raise ValueError("candidate metadata is incomplete")
+                    self._restore_candidate_record(
+                        source_type=source_type,
+                        sequence=sequence,
+                        relative_path=artifact.relative_path,
+                        sha256=artifact.sha256,
+                        candidate_id=candidate_id,
+                        source_run_id=run_id,
+                        metadata=metadata,
+                        content=content,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "skill_update_candidate_recovery_skipped path=%s error_type=%s error=%s",
+                        path.relative_to(self.storage.root).as_posix(),
+                        type(exc).__name__,
+                        exc,
+                    )
+
+    def _restore_candidate_record(
+        self,
+        *,
+        source_type: str,
+        sequence: int,
+        relative_path: str,
+        sha256: str,
+        candidate_id: uuid.UUID,
+        source_run_id: uuid.UUID,
+        metadata: dict[str, str],
+        content: str,
+    ) -> None:
+        with self.session_factory.begin() as session:
+            run = session.get(SkillUpdateRun, source_run_id, with_for_update=True)
+            outcomes = dict(run.selection_json.get("extraction_outcomes", {})) if run else {}
+            processed_snapshots = (
+                dict(run.selection_json.get("processed_snapshots", {})) if run else {}
+            )
+            matching_conversation_id: uuid.UUID | None = None
+            matching_snapshot_id: str | None = None
+            for conversation_id, outcome in outcomes.items():
+                if not isinstance(outcome, dict):
+                    continue
+                if (
+                    outcome.get("status") == "candidate_created"
+                    and outcome.get("candidate_id") == str(candidate_id)
+                    and outcome.get("relative_path") == relative_path
+                    and outcome.get("sha256") == sha256
+                    and outcome.get("fingerprint") == metadata["content_fingerprint"]
+                ):
+                    try:
+                        matching_conversation_id = uuid.UUID(conversation_id)
+                    except (TypeError, ValueError):
+                        matching_conversation_id = None
+                    processed = processed_snapshots.get(conversation_id)
+                    if isinstance(processed, dict):
+                        value = processed.get("snapshot_id")
+                        if isinstance(value, str) and value:
+                            matching_snapshot_id = value
+                    break
+            existing = session.scalar(
+                select(SkillCandidateFile)
+                .where(SkillCandidateFile.id == candidate_id)
+                .with_for_update()
+            )
+            if existing is not None:
+                if (
+                    existing.relative_path != relative_path
+                    or existing.source_conversation_type != source_type
+                    or existing.sequence != sequence
+                    or existing.content_fingerprint
+                    not in (None, metadata["content_fingerprint"])
+                ):
+                    logger.error(
+                        "skill_update_candidate_recovery_conflict candidate_id=%s "
+                        "path=%s reason=database_identity_differs_from_file",
+                        candidate_id,
+                        relative_path,
+                    )
+                    return
+                if existing.status == "writing":
+                    if existing.sha256 not in (None, sha256):
+                        logger.error(
+                            "skill_update_candidate_recovery_conflict candidate_id=%s "
+                            "path=%s reason=database_hash_differs_from_file",
+                            candidate_id,
+                            relative_path,
+                        )
+                        return
+                    existing.sha256 = sha256
+                    existing.status = "pending"
+                    existing.evidence_refs_json = [
+                        value.strip().strip("\"'")
+                        for value in metadata["evidence_refs"].strip("[]").split(",")
+                        if value.strip()
+                    ]
+                    existing.source_skill_version = metadata.get("source_skill_version")
+                    existing.content_fingerprint = metadata["content_fingerprint"]
+                    existing.run_id = run.id if run is not None else existing.run_id
+                    if run is not None:
+                        run.candidate_count += 1
+                        selection = dict(run.selection_json)
+                        outcomes = dict(selection.get("extraction_outcomes", {}))
+                        key = str(existing.conversation_id) if existing.conversation_id else None
+                        if key is not None:
+                            prior = outcomes.get(key)
+                            outcome = dict(prior) if isinstance(prior, dict) else {}
+                            outcome.update(
+                                {
+                                    "status": "candidate_created",
+                                    "reason_code": None,
+                                    "candidate_id": str(candidate_id),
+                                    "sequence": sequence,
+                                    "relative_path": relative_path,
+                                    "sha256": sha256,
+                                    "fingerprint": metadata["content_fingerprint"],
+                                    "recorded_at": datetime.now(UTC).isoformat(),
+                                }
+                            )
+                            outcomes[key] = outcome
+                            selection["extraction_outcomes"] = outcomes
+                            run.selection_json = selection
+                    logger.info(
+                        "skill_update_candidate_recovered candidate_id=%s source_type=%s "
+                        "sequence=%s status=pending relative_path=%s "
+                        "recovery=completed_interrupted_write",
+                        candidate_id,
+                        source_type,
+                        sequence,
+                        relative_path,
+                    )
+                if not existing.source_snapshot_ids_json and matching_snapshot_id:
+                    existing.source_snapshot_ids_json = [matching_snapshot_id]
+                    logger.info(
+                        "skill_update_candidate_lineage_recovered candidate_id=%s "
+                        "relative_path=%s snapshot_id=%s",
+                        candidate_id,
+                        relative_path,
+                        matching_snapshot_id,
+                    )
+                return
+            if matching_conversation_id is not None and session.get(
+                Conversation, matching_conversation_id
+            ) is None:
+                matching_conversation_id = None
+            if matching_conversation_id is not None and session.scalar(
+                select(SkillCandidateFile.id).where(
+                    SkillCandidateFile.conversation_id == matching_conversation_id,
+                    SkillCandidateFile.candidate_type == "customer_skill",
+                )
+            ) is not None:
+                logger.info(
+                    "skill_update_candidate_recovery_unverified path=%s candidate_id=%s "
+                    "reason=source_conversation_already_has_candidate",
+                    relative_path,
+                    candidate_id,
+                )
+                return
+            if session.scalar(
+                select(SkillCandidateFile.id).where(
+                    SkillCandidateFile.candidate_type == "customer_skill",
+                    SkillCandidateFile.content_fingerprint == metadata["content_fingerprint"],
+                    SkillCandidateFile.status != "rejected",
+                )
+            ) is not None:
+                logger.info(
+                    "skill_update_candidate_recovery_unverified path=%s candidate_id=%s "
+                    "reason=fingerprint_already_registered",
+                    relative_path,
+                    candidate_id,
+                )
+                return
+            counter = session.get(SkillCandidateSequence, source_type, with_for_update=True)
+            if counter is None:
+                counter = SkillCandidateSequence(
+                    scope=source_type, last_allocated_sequence=sequence
+                )
+                session.add(counter)
+            else:
+                counter.last_allocated_sequence = max(counter.last_allocated_sequence, sequence)
+            evidence_refs = [
+                value.strip().strip("\"'")
+                for value in metadata["evidence_refs"].strip("[]").split(",")
+                if value.strip()
+            ]
+            if any(not re.fullmatch(r"ev_[A-Za-z0-9_-]{1,80}", value) for value in evidence_refs):
+                raise ValueError("candidate evidence references are invalid")
+            cases: list[dict[str, str]] = []
+            for case, expected in re.findall(
+                r"(?m)^- Case: (.+)\n\s+Expected: (.+)$", content
+            ):
+                cases.append({"case": case.strip(), "expected_behavior": expected.strip()})
+            session.add(
+                SkillCandidateFile(
+                    id=candidate_id,
+                    candidate_type="customer_skill",
+                    source_conversation_type=source_type,
+                    sequence=sequence,
+                    run_id=run.id if run is not None else None,
+                    conversation_id=matching_conversation_id,
+                    target_skill_key=None,
+                    status="pending",
+                    relative_path=relative_path,
+                    sha256=sha256,
+                    content_fingerprint=metadata["content_fingerprint"],
+                    evidence_refs_json=evidence_refs,
+                    regression_cases_json=cases,
+                    source_skill_version=metadata.get("source_skill_version"),
+                    source_snapshot_ids_json=[matching_snapshot_id]
+                    if matching_snapshot_id
+                    else [f"candidate-file:{sha256}"],
+                )
+            )
+            logger.info(
+                "skill_update_candidate_recovered candidate_id=%s source_type=%s "
+                "sequence=%s status=pending relative_path=%s run_id=%s "
+                "conversation_linked=%s",
+                candidate_id,
+                source_type,
+                sequence,
+                relative_path,
+                run.id if run is not None else "none",
+                matching_conversation_id is not None,
+            )
+
+    @staticmethod
+    def _candidate_front_matter(content: str) -> dict[str, str]:
+        match = re.match(r"\A---\s*\n(?P<header>.*?)\n---\s*\n", content, re.S)
+        if match is None:
+            raise ValueError("candidate front matter is missing")
+        values: dict[str, str] = {}
+        for line in match.group("header").splitlines():
+            key, separator, value = line.partition(":")
+            if not separator:
+                raise ValueError("candidate front matter is invalid")
+            values[key.strip()] = value.strip()
+        return {
+            key: value.strip().strip("\"'")
+            for key, value in values.items()
+        }
+
+    @staticmethod
+    def _failed_batch_log_record(batch: SkillConsolidationBatch) -> dict[str, Any]:
+        validation = dict(batch.validation_json or {})
+        second_review = validation.get("second_review")
+        retry = validation.get("retry")
+        activation_failure = validation.get("activation_failure")
+        return {
+            "batch_id": str(batch.id),
+            "source_type": batch.source_conversation_type,
+            "candidate_ids": batch.candidate_ids_json,
+            "failure": (
+                second_review.get("reason_code") if isinstance(second_review, dict) else None
+            )
+            or (retry.get("last_error_code") if isinstance(retry, dict) else None)
+            or (
+                activation_failure.get("error_code")
+                if isinstance(activation_failure, dict)
+                else None
+            ),
+        }
 
     def _cleanup_terminal_work(self, batch_id: uuid.UUID) -> None:
         assert self.storage is not None
@@ -422,6 +839,12 @@ class SkillUpdateWorker:
                         **dict(batch.validation_json),
                         "work_artifacts_cleaned": True,
                     }
+                    logger.info(
+                        "skill_update_batch_work_cleanup_finished batch_id=%s "
+                        "removed_work_artifact_count=%s",
+                        batch_id,
+                        len(paths),
+                    )
 
     def _expire_snapshots(self, now: datetime) -> None:
         if self.storage is None:
@@ -503,7 +926,8 @@ def run_worker() -> None:
     logging.basicConfig(level=settings.log_level.upper(), format="%(message)s")
     logger.info(
         "skill_update_worker_started enabled=%s extraction=%s candidate_writes=%s "
-        "consolidation=%s auto_merge=%s schedule_minutes=%s batch_size=%s storage_configured=%s",
+        "consolidation=%s auto_merge=%s schedule_minutes=%s batch_size=%s "
+        "batch_max_wait_minutes=%s storage_configured=%s",
         settings.skill_updates_enabled,
         settings.skill_update_extraction_enabled,
         settings.skill_update_candidate_writes_enabled,
@@ -511,6 +935,7 @@ def run_worker() -> None:
         settings.skill_update_auto_merge_enabled,
         settings.skill_update_schedule_minutes,
         settings.skill_update_batch_size,
+        settings.skill_update_batch_max_wait_minutes,
         settings.skill_update_storage_dir is not None,
     )
     worker = SkillUpdateWorker(make_session_factory(make_engine(settings)), settings)

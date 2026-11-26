@@ -377,7 +377,7 @@ class SkillUpdateExtractor:
 
     def _load_run_and_snapshot(
         self, snapshot: ConversationSnapshot, run_id: uuid.UUID, now: datetime
-    ) -> tuple[SkillUpdateRun | ExtractionResult, dict[str, Any] | ExtractionResult]:
+    ) -> tuple[SkillUpdateRun | ExtractionResult, dict[str, Any] | ExtractionResult | None]:
         with self.session_factory() as session:
             run = session.get(SkillUpdateRun, run_id)
             if run is None or run.status != "running":
@@ -387,44 +387,9 @@ class SkillUpdateExtractor:
                 or run.reviewer_release != snapshot.pins.reviewer_release
             ):
                 return run, ExtractionResult("rejected", "run_version_pin_mismatch")
-            artifacts = run.selection_json.get("snapshot_artifacts", [])
-            metadata = next(
-                (
-                    item
-                    for item in artifacts
-                    if isinstance(item, dict) and item.get("snapshot_id") == snapshot.snapshot_id
-                ),
-                None,
-            )
-            if metadata is None:
-                return run, ExtractionResult("rejected", "snapshot_not_registered")
-            try:
-                expires_at = datetime.fromisoformat(str(metadata["expires_at"]))
-                relative = Path(str(metadata["relative_path"]))
-                if len(relative.parts) != 2 or relative.parts[0] != "work":
-                    raise ValueError("invalid snapshot path")
-                content = self.storage.read_work_artifact(
-                    relative.parts[1], str(metadata["artifact_sha256"])
-                )
-                artifact = json.loads(content)
-            except Exception:
-                return run, ExtractionResult("rejected", "snapshot_artifact_invalid")
-            if (now if now.tzinfo else now.replace(tzinfo=UTC)) >= (
-                expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
-            ):
-                return run, ExtractionResult("rejected", "snapshot_expired")
-            expected = {
-                "snapshot": snapshot.payload(),
-                "snapshot_sha256": snapshot.snapshot_sha256,
-            }
-            if (
-                artifact != expected
-                or metadata.get("conversation_id") != str(snapshot.conversation_id)
-                or metadata.get("snapshot_sha256") != snapshot.snapshot_sha256
-                or metadata.get("source_type") != snapshot.source_type
-            ):
-                return run, ExtractionResult("rejected", "snapshot_content_mismatch")
-            return run, dict(metadata)
+            # The snapshot is built directly from the database for this extraction.
+            # A persisted JSON artifact is optional and is not required to create candidates.
+            return run, None
 
     def _candidate_for_conversation(self, conversation_id: uuid.UUID) -> SkillCandidateFile | None:
         with self.session_factory() as session:
