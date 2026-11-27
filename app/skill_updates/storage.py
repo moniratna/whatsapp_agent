@@ -63,11 +63,15 @@ def _candidate_relative_path(source_type: str, sequence: int) -> str:
         raise ArtifactStorageError("unsupported candidate source type")
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
         raise ArtifactStorageError("candidate sequence must be a positive integer")
+    directory = {
+        "reviewer": "skill_reviewer",
+        "unknown": "fallback",
+    }.get(source_type, source_type)
     if source_type == "reviewer":
         filename = f"skill_reviewer_{sequence}.md"
     else:
         filename = f"{source_type}_conversation_skill_{sequence}.md"
-    return f"candidates/{source_type}/{filename}"
+    return f"{directory}/candidate_skills/{filename}"
 
 
 def _validate_candidate_markdown(content: str, source_type: str, max_bytes: int) -> bytes:
@@ -144,11 +148,9 @@ def _validate_candidate_markdown(content: str, source_type: str, max_bytes: int)
 class CandidateStorage:
     """Constrained filesystem adapter for inactive candidate and work artifacts.
 
-    The storage root must already exist, be either the dedicated ignored
-    repository candidate directory or an external location, avoid temp
-    directories, and be private to the service account. Public methods accept
-    source types, sequences, or safe work names; callers cannot supply arbitrary
-    filesystem paths.
+    The storage root is the skills directory. Candidates live beside their
+    active skill; temporary work and backups live in its ignored private
+    ``.skill_update_artifacts`` directory.
     """
 
     def __init__(
@@ -164,24 +166,23 @@ class CandidateStorage:
             raise ArtifactStorageError("storage root must be an existing absolute directory")
         self.root = root.resolve(strict=True)
         repo_root = Path(__file__).resolve().parents[2]
+        canonical_skill_root = (repo_root / "skills").resolve()
+        self.skill_root = self.root
         temp_roots = {
             Path(tempfile.gettempdir()).resolve(),
             Path("/tmp").resolve(),
             Path("/var/tmp").resolve(),
             Path("/private/tmp").resolve(),
         }
-        candidate_root = (repo_root / "skills" / "candidate_skills").resolve(strict=False)
-        if (self.root == repo_root) or (
-            repo_root in self.root.parents and self.root != candidate_root
+        if self.root != canonical_skill_root and (
+            self.root == repo_root or repo_root in self.root.parents
         ):
-            raise ArtifactStorageError(
-                "storage root inside the repository must be skills/candidate_skills"
-            )
+            raise ArtifactStorageError("storage root inside the repository must be skills")
         if not allow_ephemeral_for_tests and any(
             self.root == item or item in self.root.parents for item in temp_roots
         ):
             raise ArtifactStorageError("storage root must not use temporary storage")
-        if self.root.stat().st_mode & 0o077:
+        if self.root != canonical_skill_root and self.root.stat().st_mode & 0o077:
             raise ArtifactStorageError("storage root permissions must be restricted to its owner")
         if not os.access(self.root, os.W_OK | os.X_OK):
             raise ArtifactStorageError("storage root is not writable by the application")
@@ -192,10 +193,9 @@ class CandidateStorage:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> CandidateStorage:
-        if settings.skill_update_storage_dir is None:
-            raise ArtifactStorageError("SKILL_UPDATE_STORAGE_DIR is not configured")
+        skill_root = Path(__file__).resolve().parents[2] / "skills"
         return cls(
-            settings.skill_update_storage_dir,
+            skill_root,
             max_candidate_bytes=settings.skill_update_candidate_max_bytes,
             max_work_bytes=max(
                 settings.skill_update_consolidated_max_bytes,
@@ -208,9 +208,17 @@ class CandidateStorage:
     ) -> CandidateManifestEntry:
         relative = _candidate_relative_path(source_type, sequence)
         payload = _validate_candidate_markdown(content, source_type, self.max_candidate_bytes)
-        path = self._path_for(relative, create_parents=True)
+        path = self._candidate_path_for(relative, create_parents=True)
         digest = self._write_atomic(path, payload, replace=False)
         return CandidateManifestEntry(source_type, sequence, relative, digest)
+
+    def lock_file_path(self) -> Path:
+        artifact_root = self.root / ".skill_update_artifacts"
+        artifact_root.mkdir(mode=0o700, exist_ok=True)
+        if artifact_root.is_symlink() or not artifact_root.is_dir():
+            raise ArtifactStorageError("private artifact directory is unsafe")
+        artifact_root.chmod(0o700)
+        return artifact_root / ".active-skill-update.lock"
 
     def read_candidate(self, entry: CandidateManifestEntry) -> str:
         path = self._validate_entry_path(entry)
@@ -231,7 +239,7 @@ class CandidateStorage:
     ) -> CandidateManifestEntry | None:
         """Recover a candidate file written before its DB hash/status commit."""
         relative = _candidate_relative_path(source_type, sequence)
-        path = self._path_for(relative)
+        path = self._candidate_path_for(relative)
         if not path.exists():
             return None
         payload = self._read_file(path, max_bytes=self.max_candidate_bytes)
@@ -350,16 +358,48 @@ class CandidateStorage:
             or not _SHA256.fullmatch(entry.sha256)
         ):
             raise ArtifactStorageError("candidate manifest entry is invalid")
-        return self._path_for(expected)
+        return self._candidate_path_for(expected)
+
+    def _candidate_path_for(self, relative_path: str, *, create_parents: bool = False) -> Path:
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 3:
+            raise ArtifactStorageError("candidate path is not allowlisted")
+        if relative.parts[1] != "candidate_skills" or relative.parts[0] not in {
+            "buyer", "seller", "portfolio", "general", "fallback", "skill_reviewer"
+        }:
+            raise ArtifactStorageError("candidate path is not in a managed skill namespace")
+        path = self.skill_root / relative
+        current = self.skill_root
+        for component in relative.parts[:-1]:
+            current = current / component
+            if current.is_symlink():
+                raise ArtifactStorageError("candidate directory is a symlink")
+            if not current.exists() and create_parents:
+                current.mkdir(mode=0o700 if component == "candidate_skills" else 0o755)
+            if not current.exists() or not current.is_dir():
+                raise ArtifactStorageError("candidate directory is missing")
+            if component == "candidate_skills" and current.stat().st_mode & 0o077:
+                current.chmod(0o700)
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ArtifactStorageError("candidate path must be a regular file")
+        return path
 
     def _path_for(self, relative_path: str, *, create_parents: bool = False) -> Path:
         relative = Path(relative_path)
         if relative.is_absolute() or ".." in relative.parts or not relative.parts:
             raise ArtifactStorageError("artifact path is not allowlisted")
-        if relative.parts[0] not in {"candidates", "work", "backups"}:
+        if relative.parts[0] not in {"work", "backups"}:
             raise ArtifactStorageError("artifact path is not in a managed storage namespace")
-        path = self.root / relative
+        path = self.root / ".skill_update_artifacts" / relative
         current = self.root
+        artifact_root = self.root / ".skill_update_artifacts"
+        if not artifact_root.exists() and create_parents:
+            artifact_root.mkdir(mode=0o700)
+        if not artifact_root.is_dir() or artifact_root.is_symlink():
+            raise ArtifactStorageError("private artifact directory is missing or is a symlink")
+        if artifact_root.stat().st_mode & 0o077:
+            artifact_root.chmod(0o700)
+        current = artifact_root
         for component in relative.parts[:-1]:
             current = current / component
             if current.is_symlink():

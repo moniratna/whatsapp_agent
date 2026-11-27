@@ -1,6 +1,6 @@
 ---
 key: buyer
-release: 12
+release: 16
 intent: buyer
 triggers: [buy, buying, purchase, rent, renting, rental, lease, leasing, invest, investment, investing, rental yield, looking for, budget, bedrooms, bedroom count, bhk, location priority, location, area, neighborhood, neighbourhood, community, amenities, gym, swimming pool, pool, parking, balcony, lift, elevator, furnishing, commute, schools, transport, accessibility, preference, priorities]
 required_fields: [transaction_type, locations]
@@ -92,3 +92,41 @@ Respect a customer's clear signal that they are finished, including "nothing rig
 **Trigger:** User replies with "[ADDRESS]" as the location response.
 
 **Instruction:** Acknowledge the placeholder location (e.g., "Got it, an [ADDRESS].") and continue the intake by asking the next prioritized question (such as bedroom count) without requesting clarification on the placeholder.
+
+## Reviewed learnings
+
+### When a buyer asks about which floor they can get within their budget, the agent should respond by asking the customer to specify a preferred floor range (e.g., low, mid, high) instead of providing specific floor information, since exact floor details are not available.
+
+**Trigger:** User asks "Can you let me know which floor i can get with this budget"
+
+**Instruction:** Respond by stating that exact floor details are not available and ask the customer to indicate a preferred floor range (e.g., low, mid, high) to guide the search.
+
+## Reviewed learnings
+
+### Avoid sending duplicate identical follow‑up questions without a user response; after asking a question, wait for the user to reply or send a gentle reminder rather than repeating the exact same message.
+
+**Trigger:** Agent sends the same follow‑up question multiple times consecutively without receiving a reply from the user.
+
+**Instruction:** When a follow‑up question has already been asked and no answer has been received, do not repeat the exact same question. Instead, wait for the user’s response or, after a reasonable interval, send a brief reminder that does not duplicate the original wording.
+
+## Reviewed learnings
+
+### When a buyer signals they have no further information (e.g., says "Nothing much right now" or similar), the agent should acknowledge the signal, close the conversation with close_conversation=true, and refrain from asking any additional intake questions.
+
+**Trigger:** User replies with "Nothing much right now" (or equivalent finish signal).
+
+**Instruction:** Acknowledge the customer's statement (e.g., "Got it, thank you.") and set close_conversation=true, ending the intake without asking further questions.
+
+## Reviewed learnings
+
+### When a user indicates they didn't understand the agent's previous question (e.g., says "I didn't get it"), the agent should rephrase or clarify the question instead of repeating it verbatim, to improve comprehension and avoid frustration.
+
+**Trigger:** User replies with "I didn't get it" or similar indicating lack of understanding of the prior question.
+
+**Instruction:** Detect the user's expression of confusion and respond by restating the question in clearer or alternative wording, possibly providing an example, rather than simply repeating the exact same phrasing.
+
+### When a buyer asks to see property options before the brief is complete, the agent should explain that more details are needed and ask a focused intake question (e.g., purpose, location) instead of providing options or handing over.
+
+**Trigger:** User says "Can't you show me some options right now?"
+
+**Instruction:** Respond by stating that you need a few more details to find suitable options and ask the next prioritized question (e.g., "Could you tell me whether you're looking to buy for personal use, investment, or another purpose?")

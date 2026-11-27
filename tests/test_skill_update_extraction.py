@@ -133,7 +133,6 @@ def prepare(
         skill_updates_enabled=True,
         skill_update_extraction_enabled=True,
         skill_update_candidate_writes_enabled=True,
-        skill_update_storage_dir=root,
         skill_update_min_confidence=0.85,
     )
     extractor = SkillUpdateExtractor(factory, settings, storage, reviewer, skill_directory=SKILLS)
@@ -149,7 +148,7 @@ def test_novel_learning_creates_one_hashed_candidate_without_changing_active_ski
     result = extractor.process(snapshot, run_id, now=NOW)
 
     assert result.status == "candidate_created", result.reason_code
-    assert result.relative_path == "candidates/buyer/buyer_conversation_skill_1.md"
+    assert result.relative_path == "buyer/candidate_skills/buyer_conversation_skill_1.md"
     candidate_path = root / result.relative_path
     assert candidate_path.is_file()
     assert "[NAME]" not in candidate_path.read_text()
@@ -228,7 +227,6 @@ def test_duplicate_learning_does_not_allocate_or_write_a_second_candidate(
             skill_updates_enabled=True,
             skill_update_extraction_enabled=True,
             skill_update_candidate_writes_enabled=True,
-            skill_update_storage_dir=first_extractor.storage.root,
         ),
         first_extractor.storage,
         second_reviewer,
@@ -249,7 +247,7 @@ def test_shadow_extraction_records_quality_outcome_without_candidate_file(
     result = extractor.process(snapshot, run_id, now=NOW)
 
     assert result.status == "shadow_candidate"
-    assert not list((root / "candidates").rglob("*.md"))
+    assert not list((root / "buyer" / "candidate_skills").rglob("*.md"))
     with factory() as session:
         run = session.get(SkillUpdateRun, run_id)
         assert run is not None

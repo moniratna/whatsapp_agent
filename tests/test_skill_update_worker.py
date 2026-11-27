@@ -27,7 +27,6 @@ def test_scheduled_worker_creates_and_completes_disabled_stage_run(tmp_path: Pat
         app_env="test",
         app_release="worker-test",
         skill_updates_enabled=True,
-        skill_update_storage_dir=storage_dir,
         skill_update_schedule_minutes=60,
     )
     worker = SkillUpdateWorker(

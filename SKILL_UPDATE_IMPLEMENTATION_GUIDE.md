@@ -29,7 +29,7 @@ The following is the original diagram supplied for this proposal. The detailed s
 4. Combine the 50 candidates into a separate consolidated skill artifact.
 5. Check the artifact size. If it exceeds a configured limit, split it into two or more bounded artifacts and validate the split as a whole.
 6. Run `skill_reviewer` again against the consolidated content. It validates the proposed learnings and assigns each accepted learning to a final destination skill. The source-type prefix helps the reviewer interpret the conversation; it does not force the final destination.
-7. Group accepted learnings by final destination and apply them to the matching active file: `skills/buyer.md`, `skills/seller.md`, `skills/portfolio.md`, `skills/general.md`, or `skills/unknown.md`.
+7. Group accepted learnings by final destination and apply them to the matching active file: `skills/buyer/SKILL.md`, `skills/seller/SKILL.md`, `skills/portfolio/SKILL.md`, `skills/general/SKILL.md`, or `skills/fallback/SKILL.md`.
 8. If the merge execution is unsuccessful, retry according to a bounded retry policy. Keep source candidates until the skill update succeeds.
 9. Merge success means all accepted learnings have been added to their destination active skill files and the batch result is recorded. Then delete all 50 source candidate files claimed by that completed batch after verifying their manifest hashes. Keep candidates if processing or file updates fail.
 
@@ -40,13 +40,13 @@ The following is the original diagram supplied for this proposal. The detailed s
 3. Write a numbered candidate such as `skill_reviewer_1.md`.
 4. Evaluate the proposed reviewer against a fixed evaluation set.
 5. On failure, keep the currently active reviewer and record the candidate and failure result for diagnosis/retry.
-6. On success, merge the improvement into `skills/skill_reviewer.md` and delete the temporary reviewer candidate only after the update is durably recorded. If the reviewer finds no supported change, record a no-change result and do not create a candidate.
+6. On success, merge the improvement into `skills/skill_reviewer/SKILL.md` and delete the temporary reviewer candidate only after the update is durably recorded. If the reviewer finds no supported change, record a no-change result and do not create a candidate.
 
 The reviewer update is a separate lane. A reviewer candidate must never be merged into a customer skill, and customer learning must not be written into the reviewer instructions. Reviewer candidates are evaluated and merged individually; they do not wait for a 50-file batch.
 
 ## 3. Proposed code and local storage layout
 
-The application code and active skill files remain in the project. Candidate Markdown files and temporary artifacts are stored on the server's persistent local filesystem, outside the Git repository. The exact storage root is configurable. An administrator manually handles preserving and carrying local active skill updates across deployments/restarts.
+The application, active skills, and candidate folders live in the project. Candidate Markdown is written to the matching skill's `candidate_skills/` folder. Private temporary artifacts and backups use `skills/.skill_update_artifacts/`; no storage path environment setting is used. An administrator manually handles preserving and carrying local active skill updates across deployments/restarts.
 
 ```text
 app/
@@ -66,45 +66,32 @@ app/
   workers/
     skill_updates.py            # skill update worker entrypoint
     reviewer_updates.py         # reviewer improvement worker entrypoint
-skills/
-  buyer.md                      # current buyer skill (active runtime input)
-  seller.md                     # current seller skill (active runtime input)
-  portfolio.md                  # current portfolio skill (active runtime input)
-  general.md                    # current general skill (active runtime input)
-  unknown.md                    # current unknown-intent skill (active runtime input)
-  skill_reviewer.md             # current offline review rubric
-  evaluations/
-    reviewer_cases.jsonl         # fixed, versioned reviewer evaluation corpus
-<SKILL_UPDATE_STORAGE_DIR>/      # configured persistent local directory; not committed to Git
-  candidates/
-    buyer/                        # buyer_conversation_skill_N.md
-    seller/                       # seller_conversation_skill_N.md
-    portfolio/                    # portfolio_conversation_skill_N.md
-    general/                      # general_conversation_skill_N.md
-    unknown/                      # unknown_conversation_skill_N.md
-    reviewer/                     # skill_reviewer_N.md
-  work/                           # temporary transcript snapshots and consolidation artifacts
-docs/
-  skill-update-operations.md    # schedule, retries, recovery, alerts and retention
-migrations/versions/
-  <revision>_skill_update_jobs.py
-tests/
-  test_skill_update_selection.py
-  test_skill_update_candidates.py
-  test_skill_update_batching.py
-  test_skill_update_consolidation.py
-  test_skill_update_validation.py
-  test_skill_update_merge.py
-  test_reviewer_update_job.py
+skills/.skill_update_artifacts/   # private work files and backups; ignored by Git
+  work/
+  backups/
+skills/                          # active skills and ignored candidate folders
+  buyer/SKILL.md
+  buyer/candidate_skills/buyer_conversation_skill_N.md
+  seller/SKILL.md
+  seller/candidate_skills/seller_conversation_skill_N.md
+  portfolio/SKILL.md
+  portfolio/candidate_skills/portfolio_conversation_skill_N.md
+  general/SKILL.md
+  general/candidate_skills/general_conversation_skill_N.md
+  fallback/SKILL.md
+  fallback/candidate_skills/unknown_conversation_skill_N.md
+  skill_reviewer/SKILL.md
+  skill_reviewer/candidate_skills/skill_reviewer_N.md
+  skill_reviewer_auditor/SKILL.md
 ```
 
-Candidate `.md` files are durable local filesystem artifacts under `<SKILL_UPDATE_STORAGE_DIR>/candidates/`; use the repository's ignored `skills/candidate_skills/` directory for `SKILL_UPDATE_STORAGE_DIR`. They are not written to Git and are not runtime skills. Temporary transcripts and consolidation artifacts belong under `<SKILL_UPDATE_STORAGE_DIR>/work/` and follow the configured retention policy. The database stores operational details such as IDs, statuses, hashes, sequence allocation, leases, batch membership, evidence references, validation results, and retries. It stores candidate paths and hashes, not a duplicate candidate body. The local filesystem is the authoritative store for candidate text.
+Candidate `.md` files are durable local filesystem artifacts under each skill folder’s `candidate_skills/` directory. These folders are ignored by Git and are not runtime skills. Temporary transcripts and consolidation artifacts belong under `skills/.skill_update_artifacts/work/` and follow the configured retention policy. The database stores operational details such as IDs, statuses, hashes, sequence allocation, leases, batch membership, evidence references, validation results, and retries. It stores candidate paths and hashes, not a duplicate candidate body. The local filesystem is the authoritative store for candidate text.
 
-Keep the storage root persistent, writable, private, and outside temporary directories; the supported in-repository location is `skills/candidate_skills/`, which must remain ignored by Git and must not be served by the web server. Runtime skill loading must explicitly enumerate the active files under `skills/` and never search the candidate storage directory. The merge worker updates the active local skill files only after validation; use atomic writes with backups/recovery so an interrupted multi-file update cannot leave a partially written skill set. No Git push, branch, or repository writer is part of this workflow.
+The application uses `skills/.skill_update_artifacts/` for private temporary files and backups, and each skill’s ignored `candidate_skills/` folder for candidate Markdown. Both locations must remain excluded from web serving. Runtime skill loading must explicitly enumerate the active files under `skills/` and never search any `candidate_skills/` directory. The merge worker updates the active local skill files only after validation; use atomic writes with backups/recovery so an interrupted multi-file update cannot leave a partially written skill set. No Git push, branch, or repository writer is part of this workflow.
 
 ## 4. Data model proposal
 
-Use the database as the source of truth for job state and batch manifests. Candidate text is stored in the configured persistent local directory and addressed by stable IDs and hashes. New tables are a proposal; reuse existing `SkillReviewRun` only where its semantics fit, rather than overloading the current aggregate-only proposal model.
+Use the database as the source of truth for job state and batch manifests. Candidate text is stored in the private skill artifact directory and addressed by stable IDs and hashes. New tables are a proposal; reuse existing `SkillReviewRun` only where its semantics fit, rather than overloading the current aggregate-only proposal model.
 
 ### `skill_update_runs`
 
@@ -186,7 +173,7 @@ Ask for the budget currency when the customer gives a budget without one.
 - Given a buyer says "budget is 2 million", ask which currency before recording a normalized amount.
 ```
 
-Store files under `<SKILL_UPDATE_STORAGE_DIR>/candidates/<source_type>/` using the source conversation type in the filename, for example the first buyer batch is `buyer_conversation_skill_1.md` through `buyer_conversation_skill_50.md`. Continue numbering monotonically for later batches rather than reusing names. Use the same pattern for seller, portfolio, general, and unknown conversations. The second review may assign a different final `target_skill_key`. Reviewer candidates use `<SKILL_UPDATE_STORAGE_DIR>/candidates/reviewer/skill_reviewer_1.md`, and are evaluated and merged individually. Allocate sequences transactionally per type; never infer the next number by scanning filenames alone. Validate front matter, content size, allowed target, evidence reference format, and absence of personal data before writing with an atomic temp-file-plus-rename operation. Store metadata in the database and candidate text only in the local Markdown file.
+Store customer candidates under `skills/<skill>/candidate_skills/` using the source conversation type in the filename (unknown conversations use `skills/fallback/candidate_skills/`), for example the first buyer batch is `buyer_conversation_skill_1.md` through `buyer_conversation_skill_50.md`. Continue numbering monotonically for later batches rather than reusing names. Use the same pattern for seller, portfolio, general, and unknown conversations. The second review may assign a different final `target_skill_key`. Reviewer candidates use `skills/skill_reviewer/candidate_skills/skill_reviewer_1.md`, and are evaluated and merged individually. Allocate sequences transactionally per type; never infer the next number by scanning filenames alone. Validate front matter, content size, allowed target, evidence reference format, and absence of personal data before writing with an atomic temp-file-plus-rename operation. Store metadata in the database and candidate text only in the local Markdown file.
 
 The active skill files must continue to satisfy the metadata contract in `app/skills/loader.py` (`key`, `release`, `intent`, triggers, required/optional fields) or a deliberately versioned replacement contract. Merging a learning into an active file must preserve its metadata and required instructions.
 
@@ -258,7 +245,7 @@ Write at most one narrowly scoped reviewer candidate per trigger unless product 
 
 Run both current and candidate reviewer versions against the same versioned, de-identified fixed corpus. Compare required schema compliance, evidence accuracy, duplicate detection, policy violations, and regression outcomes. Define pass thresholds and a no-regression policy before implementation. If the candidate fails, retain the current reviewer and record the failed candidate and metrics; whether to retry is determined by an explicit transient/permanent error classification.
 
-If it passes, create a validated update to the existing `skills/skill_reviewer.md`, record the evaluation and manifest, and remove the reviewer candidate after the update is durably recorded. Preserve evaluation inputs/outputs subject to data retention policy. Pin all in-flight runs so a reviewer update cannot change the rubric midway through processing.
+If it passes, create a validated update to the existing `skills/skill_reviewer/SKILL.md`, record the evaluation and manifest, and remove the reviewer candidate after the update is durably recorded. Preserve evaluation inputs/outputs subject to data retention policy. Pin all in-flight runs so a reviewer update cannot change the rubric midway through processing.
 
 ## 8. Security, privacy, and operational controls
 
@@ -277,23 +264,23 @@ This is the proposed change inventory for implementation. Names can be adjusted 
 
 | Area                     | Existing location                                                                                 | Required change                                                                                                                                                                                                                                                                                       |
 | ------------------------ | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Runtime skill loading    | `app/skills/loader.py`                                                                            | Replace broad `*.md` discovery with an explicit allowlist for `buyer`, `seller`, `portfolio`, `general`, `unknown`, and `skill_reviewer`. Add missing active skill files using the existing metadata contract. Never load files from the configured candidate/work directory. |
+| Runtime skill loading    | `app/skills/loader.py`                                                                            | Replace broad `*.md` discovery with an explicit allowlist for `buyer`, `seller`, `portfolio`, `general`, `unknown`, and `skill_reviewer`. Add missing active skill files using the existing metadata contract. Never load files from any `candidate_skills/` directory or from `.skill_update_artifacts/`. |
 | Skill update domain      | New `app/skill_updates/` package                                                                  | Add typed schemas, eligible conversation selection, transcript snapshots/de-identification, candidate validation, deduplication, transactional IDs, batch claiming, consolidation, routing, merge checks, and manifest-scoped cleanup. Keep model calls behind an adapter that can be faked in tests. |
 | Worker entrypoints       | Existing `app/workers/`                                                                           | Add separately runnable `skill_updates` and `reviewer_updates` workers, following the session factory, settings, lease, and graceful-shutdown conventions used by current workers. Do not silently replace `skill_reviews` until migration and API compatibility are decided.                         |
 | Database state           | `app/db/models.py` and new Alembic migration                                                      | Add run, candidate metadata, batch/manifest, and reviewer evaluation records; indexes, unique idempotency constraints, status checks, timestamps, leases, and migration downgrade behavior. Store candidate path/hash and operational metadata, not candidate Markdown bodies.                        |
-| Configuration            | `app/config/settings.py`, `.env.example`                                                          | Add flags, schedule/selection limits, per-source-type batch size (50), persistent local candidate root, configurable artifact/active skill size limits, retry policy, and reviewer evaluation thresholds. Validate storage paths and filesystem permissions. |
-| Local candidate storage  | New filesystem adapter and settings                                                               | Write candidate `.md` files under `<SKILL_UPDATE_STORAGE_DIR>/candidates/<source_type>/`; write temporary snapshots/consolidations under `work/`. Use atomic writes, strict path allowlists, hashes, and manifest-only deletion. Nothing is committed or pushed to Git. |
-| Active skill merge       | `skills/buyer.md`, `skills/seller.md`, `skills/portfolio.md`, `skills/general.md`, `skills/unknown.md`, `skills/skill_reviewer.md` | Ensure all five customer skill files exist and preserve metadata/behavior. Apply validated updates to local files with backups, atomic replacement/recovery, and base-hash checks. Candidate files stay separate. |
-| Reviewer instructions    | `skills/skill_reviewer.md`                                                                        | Extend the offline review contract to emit schema-constrained evidence-backed findings and, in the reviewer lane only, constrained reviewer-improvement proposals. Pin jobs to a reviewer hash so changes do not affect an in-flight run.                                                             |
+| Configuration            | `app/config/settings.py`, `.env.example`                                                          | Add flags, schedule/selection limits, per-source-type batch size (50), configurable artifact/active skill size limits, retry policy, and reviewer evaluation thresholds. |
+| Local candidate storage  | New filesystem adapter and settings                                                               | Write candidate `.md` files under the matching `skills/<skill>/candidate_skills/` folder; write temporary snapshots/consolidations under `skills/.skill_update_artifacts/work/`. Use atomic writes, strict path allowlists, hashes, and manifest-only deletion. Nothing is committed or pushed to Git. |
+| Active skill merge       | `skills/buyer/SKILL.md`, `skills/seller/SKILL.md`, `skills/portfolio/SKILL.md`, `skills/general/SKILL.md`, `skills/fallback/SKILL.md`, `skills/skill_reviewer/SKILL.md` | Ensure all five customer skill files exist and preserve metadata/behavior. Apply validated updates to local files with backups, atomic replacement/recovery, and base-hash checks. Candidate files stay separate. |
+| Reviewer instructions    | `skills/skill_reviewer/SKILL.md`                                                                        | Extend the offline review contract to emit schema-constrained evidence-backed findings and, in the reviewer lane only, constrained reviewer-improvement proposals. Pin jobs to a reviewer hash so changes do not affect an in-flight run.                                                             |
 | API/admin visibility     | `app/api/routes/admin.py`, `app/api/schemas/` (only if required)                                  | Decide whether operators need read-only run/batch status and retry endpoints. Expose status and sanitized error codes; do not expose raw transcript snapshots or provide an unreviewed “approve” endpoint if the intended pipeline is automated.                                                      |
 | Tests                    | `tests/`                                                                                          | Add focused tests for path isolation, local candidate persistence, retries, batch races, exact-50 selection, size splitting, second review categorization, active-file rollback, hash mismatch, cleanup idempotency, and individual reviewer evaluation pass/fail. Use deterministic model/filesystem fakes. |
 | Documentation/operations | This guide and new `docs/skill-update-operations.md`                                              | Document configuration, launch sequence, job replay, stuck lease recovery, filesystem recovery, candidate retention, rollback, and alert response. Revise conflicting skill update descriptions in `IMPLEMENTATION_GUIDE.md` so there is one agreed design. |
 
 ### Local storage contract
 
-1. `<SKILL_UPDATE_STORAGE_DIR>/candidates/<source_type>/*.md` and `reviewer/*.md` are durable candidate text on the server's persistent local filesystem. Customer source types are `buyer`, `seller`, `portfolio`, `general`, and `unknown`.
+1. `skills/<skill>/candidate_skills/*.md` are durable candidate text on the server's persistent local filesystem. Customer source types are `buyer`, `seller`, `portfolio`, `general`, and `unknown`.
 2. The database stores candidate ID, type, path, hash, status, source/run IDs, target skill, evidence references, validation outcomes, timestamps, and batch linkage. It does not store a second authoritative copy of Markdown content.
-3. `<SKILL_UPDATE_STORAGE_DIR>/work/` contains ephemeral snapshots and consolidated proposals. Restrict access and clean according to retention policy.
+3. `skills/.skill_update_artifacts/work/` contains ephemeral snapshots and consolidated proposals. Restrict access and clean according to retention policy.
 4. Candidate files must contain de-identified learnings and opaque evidence IDs, never raw transcripts or direct identifiers. Restrict filesystem access to the application/service account.
 5. For candidate creation, persist the allocated DB row/sequence, write the `.md` atomically, compute its hash, then mark the DB record available. Reconcile crashes idempotently. For cleanup, verify the manifest hashes and delete all 50 candidate paths only after the active skill update and batch result are durable. If the filesystem and database disagree, stop and reconcile rather than guessing.
 
@@ -313,7 +300,7 @@ Each milestone is a small, reviewable code change. A coding agent should read th
 
 **Read:** `app/skills/loader.py`, all current `skills/*.md`, skill loader tests.
 
-**Implement:** an explicit active-skill manifest/allowlist; ensure all five customer files exist with valid metadata; validate that candidate/work paths cannot be loaded. Configure the persistent local candidate root outside the project repository.
+**Implement:** an explicit active-skill manifest/allowlist; ensure all five customer files exist with valid metadata; validate that candidate/work paths cannot be loaded. Use each skill’s ignored `candidate_skills/` folder and the internal private artifact folder under `skills/`.
 
 **Exit criteria:** current runtime skill set loads identically; candidate-looking Markdown placed in candidate/work directories is excluded; loader fails clearly if a required active skill is missing. No candidates are created by workers yet.
 
@@ -321,7 +308,7 @@ Each milestone is a small, reviewable code change. A coding agent should read th
 
 **Read:** SQLAlchemy model/migration patterns in `app/db/models.py` and `migrations/versions/`, settings conventions, worker lease patterns in `app/workers/skill_reviews.py`.
 
-**Implement:** run, candidate metadata, batch, and reviewer evaluation tables; status constraints, sequence uniqueness, idempotency constraints, leases, indexes, and timestamps. Add settings for enable flags, schedule/cohort bounds, batch count, size thresholds, retry policy, and paths. Persist paths/hashes/metadata only; never add Markdown body columns.
+**Implement:** run, candidate metadata, batch, and reviewer evaluation tables; status constraints, sequence uniqueness, idempotency constraints, leases, indexes, and timestamps. Add settings for enable flags, schedule/cohort bounds, batch count, size thresholds, and retry policy. Persist paths/hashes/metadata only; never add Markdown body columns.
 
 **Exit criteria:** migration applies and downgrades on the project's supported local DB checks; settings reject invalid/unsafe paths and malformed thresholds; auto-merge remains disabled by default.
 
@@ -331,7 +318,7 @@ Each milestone is a small, reviewable code change. A coding agent should read th
 
 **Implement:** a narrow interface for writing, reading, hashing, and deleting allowlisted `.md` candidate paths on the persistent local volume. Implement crash reconciliation between DB state and filesystem state. Create test fakes and enforce no arbitrary path, symlink escape, wildcard deletion, or raw transcript content. Do not use Git operations.
 
-**Exit criteria:** a test candidate can be written under `<SKILL_UPDATE_STORAGE_DIR>/candidates/buyer/`, retrieved by DB path/hash, and removed only by an explicit manifest; temporary content remains isolated from runtime skill loading.
+**Exit criteria:** a test candidate can be written under `skills/buyer/candidate_skills/`, retrieved by DB path/hash, and removed only by an explicit manifest; temporary content remains isolated from runtime skill loading.
 
 ### Milestone 4 — Conversation selection and snapshots (shadow mode)
 
@@ -343,7 +330,7 @@ Each milestone is a small, reviewable code change. A coding agent should read th
 
 ### Milestone 5 — Extraction, validation, and candidate files
 
-**Read:** `skills/skill_reviewer.md`, skill schemas, candidate format and policy rules in this guide.
+**Read:** `skills/skill_reviewer/SKILL.md`, skill schemas, candidate format and policy rules in this guide.
 
 **Implement:** typed model output contract, model adapter, evidence verification, policy/schema/privacy validation, duplicate comparison, source-type assignment, regression case checks, DB sequence allocation, and local candidate file creation. Name candidates `<source_type>_conversation_skill_N.md`. Record rejection/no-change outcomes in DB without writing `.md` files.
 
@@ -446,7 +433,7 @@ These operational choices complete Milestone 0. They are design contracts for la
 
 ### Persistent storage, backup, and size limits
 
-- `SKILL_UPDATE_STORAGE_DIR` must be explicitly configured to a persistent local volume outside the repository and outside temporary directories. If absent, non-persistent, inside the repository, or inaccessible, candidate creation and active updates fail closed. Restrict directory and file permissions to the service account; candidate storage must not be web-served.
+- Restrict directory and file permissions to the service account; candidate storage must not be web-served.
 - Candidate and work artifacts are not backed up as deployable skills. Pending candidates and in-flight manifests must survive process restarts and volume snapshots. Temporary snapshots/consolidation artifacts are removed after a terminal outcome; failed work is retained for diagnosis only for the applicable source-data retention window.
 - Administrators remain responsible for carrying locally updated active skill files across deployments/restarts. Before an active-file update, preserve the exact pre-update bytes and hashes in a restricted backup area on the same persistent volume. Apply multi-file updates atomically as a recoverable transaction; retain backups for 30 days after successful verification, and retain them longer while an update is unresolved. Rollback restores the exact prior bytes. No Git commit or push is performed.
 - Initial configurable byte limits for production testing: 32 KiB per customer candidate, 256 KiB per consolidated artifact part, and 128 KiB per active skill file. Enforce limits on UTF-8 encoded bytes, split consolidated content only at complete learning/rule boundaries, and reject an individual learning that cannot fit. These are starting caps to be measured and adjusted before activation, not assumptions about model token limits.

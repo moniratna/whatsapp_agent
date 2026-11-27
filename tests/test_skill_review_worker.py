@@ -68,7 +68,7 @@ def test_review_proposes_only_patterns_with_three_distinct_conversations() -> No
         assert proposal is not None
         assert proposal.distinct_conversation_count == 3
         assert proposal.validation_status == "aggregate_only"
-        assert "skills/unknown.md" in proposal.proposed_diff
+        assert "skills/fallback/SKILL.md" in proposal.proposed_diff
         assert loaded_run is not None
         assert loaded_run.status == "completed" and loaded_run.proposal_count == 1
     engine.dispose()

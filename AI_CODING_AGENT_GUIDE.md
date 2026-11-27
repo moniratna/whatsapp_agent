@@ -438,9 +438,9 @@ Implement the skill runtime in this order for every customer message:
 
 **Completion check:** adding a new Markdown skill and deploying it changes behavior without a DB skill-table migration; malformed/duplicate skills cannot be activated; each reply is traceable to the skill and release; an unknown or unsafe case reliably yields a handover rather than an invented answer.
 
-#### Offline skill reviewer contract (`skills/skill_reviewer.md`)
+#### Offline skill reviewer contract (`skills/skill_reviewer/SKILL.md`)
 
-Add `skills/skill_reviewer.md` as a separate analysis skill. It is never selected for customer conversations and cannot send WhatsApp messages. The background worker supplies it with a bounded, de-identified dataset and the deployed skill/test versions to review. The reviewer should identify recurring behavior defects such as asking for a budget already clearly captured, ignoring a customer correction, repeating a field question, or failing to hand over an unsupported question.
+Add `skills/skill_reviewer/SKILL.md` as a separate analysis skill. It is never selected for customer conversations and cannot send WhatsApp messages. The background worker supplies it with a bounded, de-identified dataset and the deployed skill/test versions to review. The reviewer should identify recurring behavior defects such as asking for a budget already clearly captured, ignoring a customer correction, repeating a field question, or failing to hand over an unsupported question.
 
 **Run policy:** support both scheduled and supervisor-triggered runs. Start with a configurable weekly cohort of the prior seven days and a default threshold of at least three distinct conversations from three distinct contacts before proposing a recurring fix. Below threshold, record a monitor-only finding or no proposal. Do not create a scheduled job that repeatedly re-processes the full corpus by default. Make period, cohort, threshold, cost/time limits, and enablement configurable. Use a deterministic cohort snapshot so a run can be reproduced.
 

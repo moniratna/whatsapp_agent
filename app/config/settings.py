@@ -1,8 +1,5 @@
 import json
-import os
-import tempfile
 from functools import lru_cache
-from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
@@ -39,9 +36,6 @@ class Settings(BaseSettings):
     export_retention_hours: int = Field(default=24, gt=0, le=720)
     exports_s3_bucket: str = ""
     exports_s3_prefix: str = "private/transcript-exports"
-    # Required before the future skill-update workflow is enabled. Kept unset
-    # by default so artifacts cannot silently land on ephemeral local storage.
-    skill_update_storage_dir: Path | None = None
     skill_updates_enabled: bool = False
     skill_update_extraction_enabled: bool = False
     skill_update_candidate_writes_enabled: bool = False
@@ -101,45 +95,6 @@ class Settings(BaseSettings):
             raise ValueError("Staging and production require OPENWA_TRANSPORT_MODE=live")
         if self.auth_mode == "oidc" and not (self.oidc_issuer_url and self.oidc_client_id):
             raise ValueError("OIDC_ISSUER_URL and OIDC_CLIENT_ID are required when AUTH_MODE=oidc")
-        storage_dir = self.skill_update_storage_dir
-        if storage_dir is not None:
-            storage_dir = storage_dir.expanduser()
-            if not storage_dir.is_absolute():
-                raise ValueError("SKILL_UPDATE_STORAGE_DIR must be an absolute path")
-            storage_dir = storage_dir.resolve(strict=False)
-            project_root = Path(__file__).resolve().parents[2]
-            temp_roots = {
-                Path(tempfile.gettempdir()).resolve(),
-                Path("/tmp").resolve(),
-                Path("/var/tmp").resolve(),
-                Path("/private/tmp").resolve(),
-            }
-            private_candidate_dir = (project_root / "skills" / "candidate_skills").resolve(
-                strict=False
-            )
-            if (storage_dir == project_root) or (
-                project_root in storage_dir.parents and storage_dir != private_candidate_dir
-            ):
-                raise ValueError(
-                    "SKILL_UPDATE_STORAGE_DIR inside the repository must be "
-                    "skills/candidate_skills"
-                )
-            if self.app_env != "test" and any(
-                storage_dir == root or root in storage_dir.parents for root in temp_roots
-            ):
-                raise ValueError("SKILL_UPDATE_STORAGE_DIR must not use temporary storage")
-            if storage_dir.exists() and not storage_dir.is_dir():
-                raise ValueError("SKILL_UPDATE_STORAGE_DIR must be a directory")
-            self.skill_update_storage_dir = storage_dir
-        if self.skill_updates_enabled or self.skill_reviewer_updates_enabled:
-            if storage_dir is None:
-                raise ValueError(
-                    "SKILL_UPDATE_STORAGE_DIR is required when skill update jobs are enabled"
-                )
-            if not storage_dir.is_dir() or not os.access(storage_dir, os.W_OK | os.X_OK):
-                raise ValueError(
-                    "SKILL_UPDATE_STORAGE_DIR must exist and be writable by the application"
-                )
         stage_flags = (
             self.skill_update_extraction_enabled,
             self.skill_update_candidate_writes_enabled,

@@ -23,7 +23,6 @@ def test_skill_update_rollout_flags_are_independently_off_and_ordered(tmp_path: 
             app_env="test",
             skill_updates_enabled=True,
             skill_update_candidate_writes_enabled=True,
-            skill_update_storage_dir=storage,
         )
 
 

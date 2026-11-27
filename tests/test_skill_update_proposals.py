@@ -137,7 +137,6 @@ def setup_batch(
         skill_update_batch_size=batch_size,
         skill_update_consolidated_max_bytes=max_bytes,
         skill_update_active_skill_max_bytes=200_000,
-        skill_update_storage_dir=storage.root,
     )
     batch_service = SkillBatchService(factory, settings, storage)
     claimed = batch_service.claim_batch("buyer", worker_id="merge-worker", now=NOW)
@@ -240,7 +239,7 @@ def test_invalid_second_review_accounting_fails_without_active_or_proposal_chang
     with pytest.raises(ProposalError, match="candidate_accounting_mismatch"):
         proposals.prepare(batch_id, worker_id="merge-worker", now=NOW)
 
-    assert not list(artifacts.root.glob("work/*-proposal-*.md"))
+    assert not list((artifacts.root / ".skill_update_artifacts").glob("work/*-proposal-*.md"))
     assert {path.name: path.read_bytes() for path in skills.glob("*.md")} == active_before
     with factory() as session:
         batch = session.get(SkillConsolidationBatch, batch_id)

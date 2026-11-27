@@ -164,7 +164,7 @@ def test_success_evaluates_candidate_individually_activates_and_cleans_one(
         .read_text()
         .startswith("---\nkey: skill_reviewer\nrelease: 2")
     )
-    assert not list((artifacts.root / "candidates" / "reviewer").glob("*.md"))
+    assert not list((artifacts.root / "skill_reviewer" / "candidate_skills").glob("*.md"))
     with factory() as session:
         run = session.get(ReviewerUpdateRun, run_id)
         candidate = session.get(SkillCandidateFile, run.candidate_id if run else None)
@@ -191,7 +191,7 @@ def test_active_passes_suite_records_no_change_without_candidate(
 
     assert result["status"] == "no_change"
     assert (skills / "skill_reviewer.md").read_bytes() == original
-    assert not list((artifacts.root / "candidates" / "reviewer").glob("*.md"))
+    assert not list((artifacts.root / "skill_reviewer" / "candidate_skills").glob("*.md"))
     with factory() as session:
         run = session.get(ReviewerUpdateRun, run_id)
         assert run is not None and run.status == "no_change" and run.candidate_id is None
@@ -207,7 +207,7 @@ def test_failed_evaluation_leaves_active_reviewer_unchanged_and_candidate_for_au
 
     assert result["status"] == "failed"
     assert (skills / "skill_reviewer.md").read_bytes() == original
-    assert len(list((artifacts.root / "candidates" / "reviewer").glob("*.md"))) == 1
+    assert len(list((artifacts.root / "skill_reviewer" / "candidate_skills").glob("*.md"))) == 1
     with factory() as session:
         run = session.get(ReviewerUpdateRun, run_id)
         candidate = session.get(SkillCandidateFile, run.candidate_id if run else None)

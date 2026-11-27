@@ -4,7 +4,13 @@ from shutil import copyfile
 import pytest
 
 from app.integrations.bedrock.provider import FakeLlm
-from app.skills.loader import SkillValidationError, load_skill, load_skills, select_skill
+from app.skills.loader import (
+    ACTIVE_SKILL_MANIFEST,
+    SkillValidationError,
+    load_skill,
+    load_skills,
+    select_skill,
+)
 
 SKILLS = Path(__file__).parents[1] / "skills"
 
@@ -38,12 +44,15 @@ def test_invalid_skill_metadata_is_rejected(tmp_path: Path) -> None:
 def test_candidate_and_work_markdown_are_excluded_from_runtime_loading(tmp_path: Path) -> None:
     active_directory = tmp_path / "active-skill-runtime"
     active_directory.mkdir()
-    for skill_file in SKILLS.glob("*.md"):
-        copyfile(skill_file, active_directory / skill_file.name)
+    for skill_file in ACTIVE_SKILL_MANIFEST.values():
+        source = SKILLS / skill_file
+        target = active_directory / skill_file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        copyfile(source, target)
     (active_directory / "buyer_conversation_skill_99.md").write_text(
         "candidate content", encoding="utf-8"
     )
-    for directory in ("candidates/buyer", "work"):
+    for directory in ("buyer/candidate_skills", "work"):
         artifact_dir = active_directory / directory
         artifact_dir.mkdir(parents=True)
         (artifact_dir / "untrusted.md").write_text("untrusted content", encoding="utf-8")

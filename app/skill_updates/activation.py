@@ -862,7 +862,7 @@ class SkillActivationService:
         if (
             path.is_symlink()
             or not path.is_file()
-            or path.resolve().parent != self.skill_directory.resolve()
+            or path.resolve().parent != (self.skill_directory / Path(ACTIVE_SKILL_MANIFEST[target]).parent).resolve()
         ):
             raise ActivationError("active_skill_path_is_unsafe")
         mode = stat.S_IMODE(path.stat().st_mode)
@@ -1118,7 +1118,7 @@ class SkillActivationService:
 
     @contextmanager
     def _file_lock(self) -> Iterator[None]:
-        lock_path = self.storage.root / ".active-skill-update.lock"
+        lock_path = self.storage.lock_file_path()
         descriptor = os.open(
             lock_path,
             os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),

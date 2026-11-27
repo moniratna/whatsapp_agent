@@ -610,7 +610,8 @@ class SkillUpdateExtractor:
         fingerprint: str,
     ) -> tuple[uuid.UUID | ExtractionResult, int | None, bool]:
         source_type = snapshot.source_type
-        relative_path = f"candidates/{source_type}/{source_type}_conversation_skill_"
+        skill_folder = "fallback" if source_type == "unknown" else source_type
+        relative_path = f"{skill_folder}/candidate_skills/{source_type}_conversation_skill_"
         with self.session_factory.begin() as session:
             eligible = session.execute(
                 select(Conversation, Contact)

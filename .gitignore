@@ -12,4 +12,7 @@ dist/
 build/
 var/private_exports/
 .frontend
+/skills/.skill_update_artifacts/
 /skills/candidate_skills/
+/skills/*/candidate_skills/*
+!/skills/*/candidate_skills/.keep

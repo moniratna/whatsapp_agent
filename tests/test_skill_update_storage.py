@@ -43,7 +43,7 @@ def test_candidate_write_read_hash_and_reconcile(storage: CandidateStorage) -> N
     content = _candidate("buyer")
     entry = storage.write_candidate("buyer", 7, content)
 
-    assert entry.relative_path == "candidates/buyer/buyer_conversation_skill_7.md"
+    assert entry.relative_path == "buyer/candidate_skills/buyer_conversation_skill_7.md"
     assert len(entry.sha256) == 64
     path = storage.root / entry.relative_path
     assert path.stat().st_mode & 0o777 == 0o600
@@ -132,7 +132,7 @@ def test_candidate_rejects_identifiers_and_transcript_content(
 ) -> None:
     with pytest.raises(ArtifactStorageError):
         storage.write_candidate("buyer", 1, _candidate("buyer", learning))
-    assert not (storage.root / "candidates/buyer/buyer_conversation_skill_1.md").exists()
+    assert not (storage.root / "buyer/candidate_skills/buyer_conversation_skill_1.md").exists()
 
 
 def test_candidate_rejects_invalid_evidence_and_wrong_namespace(storage: CandidateStorage) -> None:

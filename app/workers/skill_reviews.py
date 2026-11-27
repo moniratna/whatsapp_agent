@@ -72,7 +72,7 @@ class SkillReviewWorker:
         minimum_value = filters.get("min_distinct_conversations", 3)
         minimum = minimum_value if isinstance(minimum_value, int) else 3
         # Load and validate reviewer guidance from the deployed Markdown skill.
-        reviewer = load_skill(Path("skills/skill_reviewer.md"))
+        reviewer = load_skill(Path("skills/skill_reviewer/SKILL.md"))
         if reviewer.header.key != "skill_reviewer":
             raise ValueError("reviewer_skill_invalid")
         with self.session_factory() as session:
@@ -136,7 +136,7 @@ class SkillReviewWorker:
                     evidence_refs_json=sorted(set(evidence[reason]))[:100],
                     proposed_diff=(
                         "## Human review proposal\n\n"
-                        "Review whether `skills/unknown.md` needs an additional "
+                        "Review whether `skills/fallback/SKILL.md` needs an additional "
                         "safe response path "
                         f"for escalation reason `{reason}`. Preserve handover "
                         "behavior until a human "

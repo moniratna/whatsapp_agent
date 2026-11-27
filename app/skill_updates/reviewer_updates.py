@@ -512,9 +512,9 @@ class ReviewerUpdateLane:
         results: list[ReviewerCaseResult] = []
         if len(REVIEWER_EVAL_SUITE) != 3 or SUITE_VERSION != "reviewer-fixed-v1":
             raise RuntimeError("reviewer_fixed_suite_unavailable")
-        audit_path = self.skill_directory / "skill_reviewer_auditor.md"
+        audit_path = self.skill_directory / "skill_reviewer_auditor" / "SKILL.md"
         if not audit_path.is_file():
-            audit_path = Path(__file__).resolve().parents[2] / "skills" / "skill_reviewer_auditor.md"
+            audit_path = Path(__file__).resolve().parents[2] / "skills" / "skill_reviewer_auditor" / "SKILL.md"
         if audit_path.is_symlink() or not audit_path.is_file():
             raise RuntimeError("fixed_reviewer_auditor_skill_missing")
         audit_skill = parse_skill_text(audit_path.read_text(encoding="utf-8"), audit_path.name)
@@ -638,7 +638,7 @@ class ReviewerUpdateLane:
                 reviewer_release=active.header.release,
                 target_skill_key="skill_reviewer",
                 status="writing",
-                relative_path=f"candidates/reviewer/skill_reviewer_{sequence}.md",
+                relative_path=f"skill_reviewer/candidate_skills/skill_reviewer_{sequence}.md",
                 sha256=digest,
                 evidence_refs_json=evidence_refs,
                 regression_cases_json=[
@@ -1039,7 +1039,7 @@ class ReviewerUpdateLane:
 
     @contextmanager
     def _file_lock(self) -> Any:
-        path = self.storage.root / ".active-skill-update.lock"
+        path = self.storage.lock_file_path()
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             os.fchmod(descriptor, 0o600)

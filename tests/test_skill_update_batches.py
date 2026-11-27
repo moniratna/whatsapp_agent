@@ -96,7 +96,6 @@ def service(
             skill_update_consolidation_enabled=True,
             skill_update_batch_size=50,
             skill_update_consolidated_max_bytes=max_bytes,
-            skill_update_storage_dir=storage.root,
         ),
         storage,
     )

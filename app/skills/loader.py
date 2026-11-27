@@ -9,12 +9,12 @@ from pydantic import BaseModel, Field, ValidationError
 # Runtime skills are deliberately enumerated. Candidate and work artifacts are
 # private workflow data and must never be discovered by a directory glob.
 ACTIVE_SKILL_MANIFEST: dict[str, str] = {
-    "buyer": "buyer.md",
-    "seller": "seller.md",
-    "portfolio": "portfolio.md",
-    "general": "general.md",
-    "unknown": "unknown.md",
-    "skill_reviewer": "skill_reviewer.md",
+    "buyer": "buyer/SKILL.md",
+    "seller": "seller/SKILL.md",
+    "portfolio": "portfolio/SKILL.md",
+    "general": "general/SKILL.md",
+    "unknown": "fallback/SKILL.md",
+    "skill_reviewer": "skill_reviewer/SKILL.md",
 }
 
 
@@ -39,7 +39,8 @@ class SkillValidationError(ValueError):
 
 def load_skill(path: Path) -> Skill:
     text = path.read_text(encoding="utf-8")
-    return parse_skill_text(text, path.name)
+    filename = f"{path.parent.name}/SKILL.md" if path.name == "SKILL.md" else path.name
+    return parse_skill_text(text, filename)
 
 
 def parse_skill_text(text: str, filename: str) -> Skill:
@@ -65,7 +66,10 @@ def parse_skill_text(text: str, filename: str) -> Skill:
         header = SkillHeader.model_validate(values)
     except ValidationError as exc:
         raise SkillValidationError(f"{filename}: invalid skill metadata") from exc
-    if header.key != Path(filename).stem:
+    expected_key = Path(filename).parent.name if Path(filename).name == "SKILL.md" else Path(filename).stem
+    if expected_key == "fallback":
+        expected_key = "unknown"
+    if header.key != expected_key:
         raise SkillValidationError(f"{filename}: key must match filename")
     body = match.group("body").strip()
     if not body:
@@ -92,7 +96,8 @@ def load_skills(directory: Path) -> dict[str, Skill]:
     skills: dict[str, Skill] = {}
     for key, filename in ACTIVE_SKILL_MANIFEST.items():
         path = directory / filename
-        if path.is_symlink() or path.resolve().parent != resolved_directory:
+        expected_parent = (directory / Path(filename).parent).resolve()
+        if path.is_symlink() or path.resolve().parent != expected_parent:
             raise SkillValidationError(
                 f"{filename}: active skill must be a regular file in {directory}"
             )

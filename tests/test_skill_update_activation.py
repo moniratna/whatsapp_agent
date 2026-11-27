@@ -70,7 +70,7 @@ def test_success_updates_only_target_then_cleans_exact_batch_and_replays(
     assert result["removed_count"] == 50
     assert (skills / "buyer.md").read_bytes() != before["buyer.md"]
     assert (skills / "seller.md").read_bytes() == before["seller.md"]
-    assert not any(artifacts.root.glob("candidates/buyer/*.md"))
+    assert not any(artifacts.root.glob("buyer/candidate_skills/*.md"))
     with factory() as session:
         batch = session.get(SkillConsolidationBatch, batch_id)
         update = session.scalar(
@@ -161,7 +161,7 @@ def test_second_target_write_failure_rolls_back_and_preserves_candidates(
         service.apply(batch_id, worker_id="merge-worker", now=NOW)
 
     assert {name: (skills / name).read_bytes() for name in original} == original
-    assert len(list(artifacts.root.glob("candidates/buyer/*.md"))) == 50
+    assert len(list(artifacts.root.glob("buyer/candidate_skills/*.md"))) == 50
     with factory() as session:
         batch = session.get(SkillConsolidationBatch, batch_id)
         update = session.scalar(
@@ -221,13 +221,13 @@ def test_tampered_manifest_candidate_blocks_all_cleanup(
     batch_id, _, settings = ready_batch(factory, artifacts, skills)
     service = SkillActivationService(factory, settings, artifacts, skill_directory=skills)
     service.apply(batch_id, worker_id="merge-worker", now=NOW)
-    first = sorted((artifacts.root / "candidates" / "buyer").glob("*.md"))[0]
+    first = sorted((artifacts.root / "buyer" / "candidate_skills").glob("*.md"))[0]
     first.write_text("tampered", encoding="utf-8")
 
     with pytest.raises(ActivationError):
         service.cleanup(batch_id, now=NOW)
 
-    assert len(list((artifacts.root / "candidates" / "buyer").glob("*.md"))) == 50
+    assert len(list((artifacts.root / "buyer" / "candidate_skills").glob("*.md"))) == 50
     with factory() as session:
         rows = list(session.scalars(select(SkillCandidateFile)))
         batch = session.get(SkillConsolidationBatch, batch_id)

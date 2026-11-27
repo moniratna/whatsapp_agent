@@ -536,9 +536,9 @@ class SkillUpdateWorker:
                 )
             )
         db_paths = {
-            item.relative_to(self.storage.root).as_posix()
-            for item in (self.storage.root / "candidates").glob("*/*.md")
-            if item.parent.name in SOURCE_TYPES
+            item.relative_to(self.storage.skill_root).as_posix()
+            for source_type in SOURCE_TYPES
+            for item in (self.storage.skill_root / ("fallback" if source_type == "unknown" else source_type) / "candidate_skills").glob("*.md")
         } if self.storage is not None else set()
         known_paths = set(pending_paths)
         unregistered_paths = sorted(db_paths - known_paths)
@@ -562,9 +562,9 @@ class SkillUpdateWorker:
         """Register validated candidate files discovered in persistent storage."""
         if self.storage is None:
             return
-        candidates_root = self.storage.root / "candidates"
         for source_type in SOURCE_TYPES:
-            candidate_glob = candidates_root.joinpath(source_type).glob(
+            skill_folder = "fallback" if source_type == "unknown" else source_type
+            candidate_glob = (self.storage.skill_root / skill_folder / "candidate_skills").glob(
                 "*_conversation_skill_*.md"
             )
             for path in sorted(candidate_glob):
@@ -977,7 +977,7 @@ def run_worker() -> None:
     logger.info(
         "skill_update_worker_started enabled=%s extraction=%s candidate_writes=%s "
         "consolidation=%s auto_merge=%s schedule_minutes=%s batch_size=%s "
-        "batch_max_wait_minutes=%s storage_configured=%s",
+        "batch_max_wait_minutes=%s artifact_root=%s",
         settings.skill_updates_enabled,
         settings.skill_update_extraction_enabled,
         settings.skill_update_candidate_writes_enabled,
@@ -986,7 +986,7 @@ def run_worker() -> None:
         settings.skill_update_schedule_minutes,
         settings.skill_update_batch_size,
         settings.skill_update_batch_max_wait_minutes,
-        settings.skill_update_storage_dir is not None,
+        Path(__file__).resolve().parents[2] / "skills" / ".skill_update_artifacts",
     )
     worker = SkillUpdateWorker(make_session_factory(make_engine(settings)), settings)
     while True:
